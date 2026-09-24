@@ -51,7 +51,35 @@ export class NotificationsController {
     description:
       'Queues a notification for delivery at `sendAt` or after `delaySeconds`. Safe to retry: the same `idempotencyKey` and body return the original job with 200 instead of creating another.',
   })
-  @ApiBody({ type: ScheduleNotificationDto })
+  @ApiBody({
+    type: ScheduleNotificationDto,
+    // Ready-to-send bodies for "Try it out". Without them Swagger merges every
+    // field's example, which sets both sendAt and delaySeconds and gets a 400.
+    examples: {
+      delayed: {
+        summary: 'Send in 60 seconds',
+        value: {
+          recipient: 'user@example.com',
+          channel: 'EMAIL',
+          payload: { subject: 'Welcome', body: 'Welcome to Notify Queue' },
+          priority: 'HIGH',
+          delaySeconds: 60,
+          idempotencyKey: 'welcome-user-123',
+        },
+      },
+      scheduled: {
+        summary: 'Send at a set time',
+        value: {
+          recipient: '+2348012345678',
+          channel: 'SMS',
+          payload: { body: 'Your appointment is tomorrow at 9:00.' },
+          priority: 'NORMAL',
+          sendAt: '2026-12-01T08:00:00Z',
+          idempotencyKey: 'appointment-reminder-42',
+        },
+      },
+    },
+  })
   @ApiCreatedResponse({ type: NotificationResponseDto, description: 'Job created.' })
   @ApiOkResponse({
     type: NotificationResponseDto,

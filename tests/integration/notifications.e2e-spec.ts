@@ -220,6 +220,18 @@ describe('Notifications API (HTTP + PostgreSQL)', () => {
   });
 
   describe('Swagger', () => {
+    it('offers "Try it out" examples that the API actually accepts', async () => {
+      const docs = await http.get('/api/docs-json').expect(200);
+      const examples = docs.body.paths['/notifications'].post.requestBody.content[
+        'application/json'
+      ].examples as Record<string, { value: Record<string, unknown> }>;
+
+      expect(Object.keys(examples).sort()).toEqual(['delayed', 'scheduled']);
+      for (const { value } of Object.values(examples)) {
+        await http.post('/notifications').send(value).expect(201);
+      }
+    });
+
     it('documents the notification endpoints and their models', async () => {
       const res = await http.get('/api/docs-json').expect(200);
 
