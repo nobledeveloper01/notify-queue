@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { errorMessage } from '../common/utils/error.util.js';
 import type { AppConfig } from '../config/configuration.js';
 import type { NotificationJob } from '../notifications/entities/notification-job.entity.js';
 import type { DeliveryResult } from './dto/delivery-result.dto.js';
@@ -48,7 +49,7 @@ export class DeliveryService {
       .catch((error: unknown): DeliveryResult => ({
         outcome: 'failed',
         retryable: true,
-        error: error instanceof Error ? error.message : 'Provider call failed',
+        error: errorMessage(error, 'Provider call failed'),
       }));
 
     try {

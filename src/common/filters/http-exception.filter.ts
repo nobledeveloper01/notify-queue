@@ -4,6 +4,7 @@ import type { ArgumentsHost, ExceptionFilter } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import type { ErrorResponseDto, FieldErrorDto } from '../dto/error-response.dto.js';
 import { ensureRequestId } from '../middleware/request-id.middleware.js';
+import { loggableError } from '../utils/error.util.js';
 
 /**
  * Errors from Express middleware (body-parser's 413 and malformed-JSON 400)
@@ -65,10 +66,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
             };
 
     if (!expected) {
-      this.logger.error(
-        { requestId, method: request.method, path: request.path, err: exception },
-        exception instanceof Error ? exception.stack : undefined,
-      );
+      const { stack, ...error } = loggableError(exception);
+      this.logger.error({ requestId, method: request.method, path: request.path, error }, stack);
     }
 
     response.status(body.statusCode).json(body);

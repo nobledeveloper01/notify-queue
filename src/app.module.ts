@@ -7,6 +7,7 @@ import { LoggingModule } from './common/logging/logging.module.js';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter.js';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware.js';
 import { RequestLoggingMiddleware } from './common/middleware/request-logging.middleware.js';
+import { RoleRoutesMiddleware } from './common/middleware/role-routes.middleware.js';
 import { createValidationPipe } from './common/pipes/validation.pipe.js';
 import { configuration } from './config/configuration.js';
 import { DatabaseModule } from './database/database.module.js';
@@ -42,7 +43,7 @@ import { WorkersModule } from './workers/workers.module.js';
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
     consumer
-      .apply(RequestIdMiddleware, RequestLoggingMiddleware)
+      .apply(RequestIdMiddleware, RequestLoggingMiddleware, RoleRoutesMiddleware)
       .forRoutes({ path: '{*splat}', method: RequestMethod.ALL });
   }
 }

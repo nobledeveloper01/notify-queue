@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { Injectable, Logger } from '@nestjs/common';
+import { loggableError } from '../common/utils/error.util.js';
 import { DeliveryService } from '../delivery/delivery.service.js';
 import type { NotificationJob } from '../notifications/entities/notification-job.entity.js';
 import { NotificationJobRepository } from '../notifications/repositories/notification-job.repository.js';
@@ -9,10 +10,11 @@ import { JobClaimService } from './job-claim.service.js';
 
 /**
  * Takes one claimed job through one delivery attempt and records the outcome.
- * A recipient over its rate limit is not an attempt: the job goes back to the
- * queue, due when a slot frees, with its attempt refunded.
  * Runs with no database transaction or lock held: the claim committed before
  * this starts, and each outcome is its own short, token-fenced UPDATE.
+ *
+ * A recipient over its rate limit is not an attempt: the job goes back to the
+ * queue, due when a slot frees, with its attempt refunded.
  */
 @Injectable()
 export class JobProcessorService {
@@ -26,12 +28,24 @@ export class JobProcessorService {
     private readonly claims: JobClaimService,
   ) {}
 
-  /** Never rejects: an unexpected error leaves the job to lease-expiry recovery. */
+  /**
+   * Never rejects. If something fails before the provider is called, the
+   * attempt is handed back (refunded, due now). If it fails after, the
+   * provider may have delivered, so the job is left to lease-expiry recovery,
+   * which resends with the same delivery key.
+   */
   async process(job: NotificationJob, claimToken: string): Promise<void> {
     const started = performance.now();
     const context = { workerId: this.claims.workerId, jobId: job.id, attempt: job.attemptCount };
+    let providerCalled = false;
 
     try {
+      if (!(await this.claims.start(job.id, claimToken))) {
+        // Reclaimed while waiting in this worker's queue: someone else owns it.
+        this.logger.warn({ ...context, event: 'job.claim_lost', stage: 'start' });
+        return;
+      }
+
       const admission = await this.rateLimit.admit(job);
       if (!admission.allowed) {
         const recorded = await this.jobs.deferRateLimited(job.id, claimToken, admission.retryAt);
@@ -43,6 +57,7 @@ export class JobProcessorService {
         return;
       }
 
+      providerCalled = true;
       const result = await this.delivery.deliver(job);
       const durationMs = Math.round(performance.now() - started);
 
@@ -66,12 +81,34 @@ export class JobProcessorService {
         durationMs,
       });
     } catch (error: unknown) {
-      this.logger.error({
-        ...context,
-        event: 'job.processing_error',
-        error: error instanceof Error ? error.message : String(error),
-        durationMs: Math.round(performance.now() - started),
-      });
+      const { stack, ...details } = loggableError(error);
+      this.logger.error(
+        {
+          ...context,
+          event: 'job.processing_error',
+          providerCalled,
+          error: details,
+          durationMs: Math.round(performance.now() - started),
+        },
+        stack,
+      );
+      if (!providerCalled) {
+        await this.handBack(job, claimToken, context);
+      }
+    }
+  }
+
+  /** Nothing reached the provider: return the job now instead of waiting out the lease. */
+  private async handBack(
+    job: NotificationJob,
+    claimToken: string,
+    context: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const released = await this.claims.release(job.id, claimToken);
+      this.logger.warn({ ...context, event: released ? 'job.released' : 'job.claim_lost' });
+    } catch {
+      // The database is likely unreachable; lease expiry will recover the job.
     }
   }
 }

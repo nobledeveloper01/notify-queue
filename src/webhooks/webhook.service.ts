@@ -8,6 +8,7 @@ import {
   WEBHOOK_EVENT_ID_HEADER,
 } from '../common/constants/webhook.constants.js';
 import type { AppConfig, WebhookConfig } from '../config/configuration.js';
+import { errorMessage } from '../common/utils/error.util.js';
 import { RetryPolicyService } from '../retry/retry-policy.service.js';
 import type { WebhookEventDto } from './dto/webhook-event.dto.js';
 import { WebhookEventRepository } from './repositories/webhook-event.repository.js';
@@ -64,6 +65,13 @@ export class WebhookService {
     }
   }
 
+  /**
+   * One POST, then one bookkeeping write. The two are kept apart: an
+   * endpoint that returned 2xx has the event, so a failure to *record* that
+   * must not be counted as a failed delivery (or, on the last attempt, as
+   * giving up). Such an event is simply redelivered after its lease, which
+   * at-least-once delivery allows. Never throws.
+   */
   private async dispatch(event: ClaimedWebhookEvent): Promise<keyof DispatchReport> {
     const body: WebhookEventDto = {
       eventId: event.id,
@@ -72,7 +80,13 @@ export class WebhookService {
       attemptCount: event.attemptCount,
       timestamp: event.occurredAt.toISOString(),
     };
+    const context = {
+      eventId: event.id,
+      jobId: event.jobId,
+      dispatchAttempt: event.dispatchAttempts,
+    };
 
+    let failure: string | null = null;
     try {
       await firstValueFrom(
         this.http.post(this.config.url as string, body, {
@@ -80,27 +94,34 @@ export class WebhookService {
           headers: { [WEBHOOK_EVENT_ID_HEADER]: event.id },
         }),
       );
-      await this.events.markDelivered(event.id);
-      return 'delivered';
     } catch (error: unknown) {
-      const reason = describeError(error);
-      const context = {
-        event: 'webhook.failed',
-        eventId: event.id,
-        jobId: event.jobId,
-        dispatchAttempt: event.dispatchAttempts,
-        error: reason,
-      };
+      failure = describeError(error);
+    }
 
+    try {
+      if (failure === null) {
+        await this.events.markDelivered(event.id);
+        return 'delivered';
+      }
       if (event.dispatchAttempts >= this.config.maxAttempts) {
-        await this.events.markGivenUp(event.id, reason);
-        this.logger.error({ ...context, gaveUp: true });
+        await this.events.markGivenUp(event.id, event.dispatchAttempts, failure);
+        this.logger.error({ ...context, event: 'webhook.failed', error: failure, gaveUp: true });
         return 'givenUp';
       }
       const delayMs = this.retryPolicy.delayAfterAttempt(event.dispatchAttempts);
-      await this.events.scheduleRetry(event.id, delayMs, reason);
-      this.logger.warn({ ...context, retryInMs: delayMs });
+      await this.events.scheduleRetry(event.id, event.dispatchAttempts, delayMs, failure);
+      this.logger.warn({ ...context, event: 'webhook.failed', error: failure, retryInMs: delayMs });
       return 'retrying';
+    } catch (error: unknown) {
+      // The outcome could not be recorded; the lease expires and the event is
+      // dispatched again.
+      this.logger.error({
+        ...context,
+        event: 'webhook.record_failed',
+        delivered: failure === null,
+        error: errorMessage(error),
+      });
+      return failure === null ? 'delivered' : 'retrying';
     }
   }
 }
@@ -109,5 +130,5 @@ const describeError = (error: unknown): string => {
   if (isAxiosError(error)) {
     return error.response ? `HTTP ${error.response.status}` : (error.code ?? error.message);
   }
-  return error instanceof Error ? error.message : 'Unknown error';
+  return errorMessage(error);
 };

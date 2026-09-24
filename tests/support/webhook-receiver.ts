@@ -10,7 +10,10 @@ export interface ReceivedWebhook {
  * A real HTTP endpoint for the dispatcher to call. `respond` picks the status
  * for the nth request (1-based), so tests can script failures.
  */
-export const startWebhookReceiver = async (respond: (n: number) => number = () => 200) => {
+export const startWebhookReceiver = async (
+  respond: (n: number) => number = () => 200,
+  delayMs = 0,
+) => {
   const received: ReceivedWebhook[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -21,7 +24,7 @@ export const startWebhookReceiver = async (respond: (n: number) => number = () =
         body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
       });
       res.statusCode = respond(received.length);
-      res.end();
+      setTimeout(() => res.end(), delayMs);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

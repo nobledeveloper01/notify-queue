@@ -96,6 +96,28 @@ describe('Operations endpoints and logging (HTTP + PostgreSQL)', () => {
     });
   });
 
+  describe('worker role', () => {
+    it('answers only /health and /metrics', async () => {
+      const worker = await createTestApp({
+        env: { APP_ROLE: 'worker', WORKER_POLL_INTERVAL_MS: '60000' },
+      });
+      try {
+        const workerHttp = request(worker.getHttpServer());
+        await workerHttp.get('/health').expect(200);
+        await workerHttp.get('/metrics').expect(200);
+        const res = await workerHttp.post('/notifications').send({}).expect(404);
+        expect(res.body).toMatchObject({ statusCode: 404, error: 'Not Found' });
+        expect(res.body.message).toMatch(/APP_ROLE=worker/);
+        // Swagger mounts on Express directly, outside Nest's middleware: it
+        // must not be registered on a worker at all.
+        await workerHttp.get('/api/docs').expect(404);
+        await workerHttp.get('/api/docs-json').expect(404);
+      } finally {
+        await worker.close();
+      }
+    });
+  });
+
   describe('structured logs', () => {
     it('writes one request line with requestId, method, path, status and duration, and no payload', async () => {
       await http

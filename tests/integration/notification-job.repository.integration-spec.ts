@@ -167,6 +167,28 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
     });
   });
 
+  describe('startAttempt', () => {
+    it('renews the lease for the claim holder', async () => {
+      const { job } = await repository.insertIfAbsent(newJob());
+      const { claimToken } = await repository.claimDueJobs('worker-a', 1);
+      await ageClaim(job.id, 600);
+
+      await expect(repository.startAttempt(job.id, claimToken)).resolves.toBe(true);
+
+      expect((await repository.recoverStaleClaims(300, 100)).requeued).toEqual([]);
+    });
+
+    it('refuses a claim that was lost while the job waited', async () => {
+      const { job } = await repository.insertIfAbsent(newJob());
+      const stale = await repository.claimDueJobs('worker-a', 1);
+      await ageClaim(job.id, 600);
+      await repository.recoverStaleClaims(300, 100);
+      await repository.claimDueJobs('worker-b', 1);
+
+      await expect(repository.startAttempt(job.id, stale.claimToken)).resolves.toBe(false);
+    });
+  });
+
   describe('completing a claim', () => {
     it('marks the job SENT and releases the claim', async () => {
       const { job } = await repository.insertIfAbsent(newJob());
@@ -284,14 +306,18 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
       expect(await events(job.id)).toEqual([]);
     });
 
-    it('writes an event when recovery dead-letters an expired final attempt', async () => {
+    it('writes an event only when recovery actually dead-letters', async () => {
       const { job } = await repository.insertIfAbsent(newJob({ maxAttempts: 1 }));
       await repository.claimDueJobs('worker-a', 1);
       await ageClaim(job.id, 600);
+      await repository.recoverStaleClaims(300, 100);
+      expect(await events(job.id)).toEqual([]);
 
+      await repository.claimDueJobs('worker-b', 1);
+      await ageClaim(job.id, 600);
       await repository.recoverStaleClaims(300, 100);
 
-      expect(await events(job.id)).toEqual([{ status: 'DEAD_LETTERED', attempt_count: 1 }]);
+      expect(await events(job.id)).toEqual([{ status: 'DEAD_LETTERED', attempt_count: 2 }]);
     });
   });
 
@@ -324,15 +350,43 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
       expect((await reload(job.id)).attemptCount).toBe(2);
     });
 
-    it('dead-letters an expired claim that was the final attempt', async () => {
+    it("grants one reconciliation attempt when a final attempt's claim expires", async () => {
       const { job } = await repository.insertIfAbsent(newJob({ maxAttempts: 1 }));
       await repository.claimDueJobs('worker-a', 1);
       await ageClaim(job.id, 600);
 
       const outcome = await repository.recoverStaleClaims(300, 100);
 
+      expect(outcome).toEqual({ requeued: [job.id], deadLettered: [] });
+      const granted = await reload(job.id);
+      expect([granted.status, granted.maxAttempts, granted.reconciliationGranted]).toEqual([
+        JobStatus.Pending,
+        2,
+        true,
+      ]);
+      expect(granted.lastError).toMatch(/one reconciliation attempt granted/);
+      const retry = await repository.claimDueJobs('worker-b', 1);
+      expect(retry.jobs.map((j) => j.attemptCount)).toEqual([2]);
+    });
+
+    it("dead-letters when the reconciliation attempt's claim expires too", async () => {
+      const { job } = await repository.insertIfAbsent(newJob({ maxAttempts: 1 }));
+      await repository.claimDueJobs('worker-a', 1);
+      await ageClaim(job.id, 600);
+      await repository.recoverStaleClaims(300, 100);
+      await repository.claimDueJobs('worker-b', 1);
+      await ageClaim(job.id, 600);
+
+      const outcome = await repository.recoverStaleClaims(300, 100);
+
       expect(outcome).toEqual({ requeued: [], deadLettered: [job.id] });
-      expect((await reload(job.id)).deadLetteredAt).toBeInstanceOf(Date);
+      const dead = await reload(job.id);
+      expect([dead.status, dead.attemptCount, dead.maxAttempts]).toEqual([
+        JobStatus.DeadLettered,
+        2,
+        2,
+      ]);
+      expect(dead.deadLetteredAt).toBeInstanceOf(Date);
     });
   });
 });

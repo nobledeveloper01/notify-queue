@@ -212,9 +212,28 @@ export class NotificationJobRepository {
   }
 
   /**
-   * PROCESSING → PENDING without counting an attempt: for jobs a worker
-   * claimed but never started (it is shutting down). They are due again
-   * immediately rather than waiting out the lease.
+   * Marks the moment a worker actually starts a claimed job, renewing the
+   * lease. Jobs wait in a worker's local queue after being claimed; without
+   * this, that wait would eat into the lease, and a job reclaimed while
+   * waiting would still be sent by the original worker. False means the claim
+   * is gone and the job must not be started.
+   */
+  async startAttempt(id: string, claimToken: string): Promise<boolean> {
+    const result = await this.jobs
+      .createQueryBuilder()
+      .update(NotificationJob)
+      .set({ lockedAt: () => 'now()' })
+      .where('id = :id', { id })
+      .andWhere('claim_token = :claimToken', { claimToken })
+      .andWhere('status = :status', { status: JobStatus.Processing })
+      .execute();
+    return result.affected === 1;
+  }
+
+  /**
+   * PROCESSING → PENDING without counting an attempt, due now: for a job whose
+   * attempt never reached the provider (the worker is shutting down, or failed
+   * before sending).
    */
   releaseClaim(id: string, claimToken: string): Promise<boolean> {
     return this.completeClaim(id, claimToken, JobStatus.Pending, {
@@ -242,7 +261,15 @@ export class NotificationJobRepository {
 
   /**
    * Returns jobs whose lease expired (the owning worker crashed or hung) to
-   * PENDING, or dead-letters them if the expired claim was their last attempt.
+   * PENDING. This and `completeClaim` are the only ways out of PROCESSING;
+   * both move only along edges the state machine allows (PROCESSING → PENDING
+   * or DEAD_LETTERED).
+   *
+   * An expired *final* attempt is ambiguous: the worker may have died after
+   * the provider accepted the notification. So the first time, the job gets
+   * one extra attempt (`reconciliation_granted`); resending with the same
+   * delivery key settles it. Only an expired attempt after that grant is
+   * dead-lettered, which still bounds a job that crashes every worker.
    *
    * The owner may still be alive and merely slow. Its claim token is cleared
    * here, so when it finishes, its `markSent` matches no row and is rejected;
@@ -253,17 +280,23 @@ export class NotificationJobRepository {
     visibilityTimeoutSeconds: number,
     limit: number,
   ): Promise<RecoveryOutcome> {
-    // One statement: requeue or dead-letter the expired claims, and write the
-    // outbox event for every dead-lettered one, atomically.
+    // One statement: requeue, grant a reconciliation attempt, or dead-letter
+    // each expired claim, and write the outbox event for every dead-lettered
+    // one, atomically. Every SET expression reads the row's values from
+    // before the update.
     const { records } = await this.run<{ id: string; status: JobStatus }>(
       `WITH recovered AS (
        UPDATE notification_jobs
-          SET status = CASE WHEN attempt_count >= max_attempts
+          SET status = CASE WHEN attempt_count >= max_attempts AND reconciliation_granted
                             THEN $2 ELSE $3 END,
-              dead_lettered_at = CASE WHEN attempt_count >= max_attempts
+              dead_lettered_at = CASE WHEN attempt_count >= max_attempts AND reconciliation_granted
                                       THEN now() ELSE NULL END,
+              max_attempts = CASE WHEN attempt_count >= max_attempts AND NOT reconciliation_granted
+                                  THEN max_attempts + 1 ELSE max_attempts END,
+              reconciliation_granted = reconciliation_granted OR attempt_count >= max_attempts,
               next_attempt_at = now(),
-              last_error = $6,
+              last_error = CASE WHEN attempt_count >= max_attempts AND NOT reconciliation_granted
+                                THEN $7 ELSE $6 END,
               locked_by = NULL,
               locked_at = NULL,
               claim_token = NULL,
@@ -290,6 +323,7 @@ export class NotificationJobRepository {
         visibilityTimeoutSeconds,
         limit,
         `Claim expired after ${visibilityTimeoutSeconds}s without completion`,
+        `Final attempt's claim expired after ${visibilityTimeoutSeconds}s; outcome unknown, one reconciliation attempt granted`,
       ],
     );
 
@@ -300,7 +334,8 @@ export class NotificationJobRepository {
   }
 
   /**
-   * The one place a claimed job leaves PROCESSING. The WHERE clause is the
+   * How a claimed job leaves PROCESSING on its worker's own report (lease
+   * expiry is the other way; see `recoverStaleClaims`). The WHERE clause is the
    * fence: the row must still carry this claim's token and be in a status the
    * state machine allows to move to `to`. Zero rows updated means the claim
    * was lost (lease expired and reclaimed), and the caller must not assume

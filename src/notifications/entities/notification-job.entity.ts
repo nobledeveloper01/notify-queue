@@ -67,6 +67,13 @@ export class NotificationJob {
   @Column({ name: 'max_attempts', type: 'integer' })
   maxAttempts: number;
 
+  /**
+   * Set when recovery granted this job one extra attempt because its final
+   * attempt's claim expired (the provider may have accepted it). Once only.
+   */
+  @Column({ name: 'reconciliation_granted', type: 'boolean', default: false })
+  reconciliationGranted: boolean;
+
   @Column({ name: 'locked_at', type: 'timestamptz', nullable: true })
   lockedAt: Date | null;
 

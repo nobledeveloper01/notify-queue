@@ -139,6 +139,16 @@ describe('Notifications API (HTTP + PostgreSQL)', () => {
       expect(fields).toEqual(['channel', 'delaySeconds', 'payload', 'priority']);
     });
 
+    it('rejects NUL characters, which PostgreSQL cannot store, with 400 instead of 500', async () => {
+      const res = await http
+        .post('/notifications')
+        .send(body({ recipient: 'a\u0000b@example.com', payload: { body: 'x\u0000y' } }))
+        .expect(400);
+
+      const fields = (res.body.details as { field: string }[]).map((d) => d.field).sort();
+      expect(fields).toEqual(['payload', 'recipient']);
+    });
+
     it('rejects a schedule more than a year ahead', async () => {
       await http
         .post('/notifications')

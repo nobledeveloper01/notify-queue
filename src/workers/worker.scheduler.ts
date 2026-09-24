@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import type { AppConfig, WorkerConfig } from '../config/configuration.js';
 import { AppRole } from '../config/env.validation.js';
+import { errorMessage } from '../common/utils/error.util.js';
 import { WebhookService } from '../webhooks/webhook.service.js';
 import { WorkerRecoveryService } from './worker-recovery.service.js';
 import { WorkerService } from './worker.service.js';
@@ -29,6 +30,8 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
   private readonly enabled: boolean;
   private running = false;
   private currentTick: Promise<void> = Promise.resolve();
+  /** Recovery and webhook runs in flight; shutdown waits for them before the pool closes. */
+  private readonly background = new Set<Promise<void>>();
 
   constructor(
     private readonly registry: SchedulerRegistry,
@@ -58,13 +61,17 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
 
     this.registry.addInterval(
       RECOVERY_INTERVAL,
-      setInterval(() => void this.recoverSafely(), this.config.recoveryIntervalMs),
+      setInterval(() => {
+        this.track(this.recoverSafely());
+      }, this.config.recoveryIntervalMs),
     );
-    void this.recoverSafely();
+    this.track(this.recoverSafely());
     if (this.webhooks.enabled) {
       this.registry.addInterval(
         WEBHOOK_INTERVAL,
-        setInterval(() => void this.dispatchWebhooksSafely(), this.webhookPollIntervalMs),
+        setInterval(() => {
+          this.track(this.dispatchWebhooksSafely());
+        }, this.webhookPollIntervalMs),
       );
     }
     this.scheduleNextPoll(0);
@@ -80,7 +87,13 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
     }
 
     await this.currentTick;
+    await Promise.allSettled([...this.background]);
     await this.worker.shutdown(this.config.shutdownTimeoutMs);
+  }
+
+  private track(run: Promise<void>): void {
+    this.background.add(run);
+    void run.finally(() => this.background.delete(run));
   }
 
   private scheduleNextPoll(delayMs: number): void {
@@ -106,7 +119,7 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       this.logger.error({
         event: 'worker.poll_failed',
         workerId: this.config.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
       });
     }
     this.scheduleNextPoll(nextDelay);
@@ -119,7 +132,7 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       this.logger.error({
         event: 'webhook.dispatch_failed',
         workerId: this.config.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
       });
     }
   }
@@ -131,7 +144,7 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       this.logger.error({
         event: 'worker.recovery_failed',
         workerId: this.config.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
       });
     }
   }

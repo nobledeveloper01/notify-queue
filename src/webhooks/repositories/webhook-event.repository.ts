@@ -67,20 +67,30 @@ export class WebhookEventRepository {
     );
   }
 
-  async scheduleRetry(id: string, delayMs: number, error: string): Promise<void> {
+  /**
+   * The failure updates are fenced on the dispatch attempt that produced
+   * them: if this dispatcher's lease ran out and another dispatcher has
+   * already claimed the event again, a late failure report changes nothing.
+   */
+  async scheduleRetry(
+    id: string,
+    dispatchAttempt: number,
+    delayMs: number,
+    error: string,
+  ): Promise<void> {
     await this.dataSource.query(
       `UPDATE webhook_events
-          SET next_attempt_at = now() + make_interval(secs => $2), last_error = $3
-        WHERE id = $1 AND delivered_at IS NULL`,
-      [id, delayMs / 1000, error],
+          SET next_attempt_at = now() + make_interval(secs => $3), last_error = $4
+        WHERE id = $1 AND dispatch_attempts = $2 AND delivered_at IS NULL`,
+      [id, dispatchAttempt, delayMs / 1000, error],
     );
   }
 
-  async markGivenUp(id: string, error: string): Promise<void> {
+  async markGivenUp(id: string, dispatchAttempt: number, error: string): Promise<void> {
     await this.dataSource.query(
-      `UPDATE webhook_events SET failed_at = now(), last_error = $2
-        WHERE id = $1 AND delivered_at IS NULL`,
-      [id, error],
+      `UPDATE webhook_events SET failed_at = now(), last_error = $3
+        WHERE id = $1 AND dispatch_attempts = $2 AND delivered_at IS NULL`,
+      [id, dispatchAttempt, error],
     );
   }
 }

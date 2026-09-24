@@ -1,7 +1,9 @@
-import { pino } from 'pino';
+import { pino, stdSerializers } from 'pino';
 import type { DestinationStream, Logger } from 'pino';
+import { QueryFailedError } from 'typeorm';
 import type { AppConfig } from '../../config/configuration.js';
 import { NodeEnvironment } from '../../config/env.validation.js';
+import { loggableError } from '../utils/error.util.js';
 
 export type LoggerSettings = Pick<AppConfig, 'nodeEnv' | 'role' | 'logLevel'>;
 
@@ -17,6 +19,11 @@ export const REDACTED_PATHS = [
   'req.headers',
   'headers',
   '*.password',
+  // A TypeORM QueryFailedError logged whole carries its SQL and bound values.
+  'parameters',
+  '*.parameters',
+  '*.query',
+  '*.driverError',
 ];
 
 /**
@@ -33,6 +40,14 @@ export const createPinoLogger = (
     base: { service: 'notify-queue', role: settings.role, pid: process.pid },
     timestamp: pino.stdTimeFunctions.isoTime,
     redact: { paths: REDACTED_PATHS, censor: '[redacted]' },
+    serializers: {
+      // A database error's message and stack can quote input values; log
+      // only its class and codes, whoever logs it.
+      err: (error: unknown) =>
+        error instanceof QueryFailedError
+          ? loggableError(error)
+          : stdSerializers.err(error as Error),
+    },
   };
 
   if (destination) {

@@ -39,6 +39,7 @@ const jobFrom = (input: NewNotificationJob): NotificationJob => {
     nextAttemptAt: now,
     attemptCount: 0,
     maxAttempts: input.maxAttempts,
+    reconciliationGranted: false,
     lockedAt: null,
     lockedBy: null,
     claimToken: null,

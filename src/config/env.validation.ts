@@ -21,7 +21,8 @@ export enum NodeEnvironment {
 
 /**
  * Which half of the system this process runs. One image, one entrypoint:
- * `api` serves HTTP only, `worker` polls and delivers only, `all` does both
+ * `api` serves the HTTP API and never delivers; `worker` polls and delivers,
+ * and answers only /health and /metrics over HTTP; `all` does both
  * (convenient for local development).
  */
 export enum AppRole {

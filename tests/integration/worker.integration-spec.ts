@@ -1,6 +1,8 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { jest } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
 import type { DataSource } from 'typeorm';
+import { JobPriority } from '../../src/common/enums/job-priority.enum.js';
 import { JobStatus } from '../../src/common/enums/job-status.enum.js';
 import type { NotificationProvider } from '../../src/delivery/providers/notification-provider.interface.js';
 import { NotificationJobRepository } from '../../src/notifications/repositories/notification-job.repository.js';
@@ -19,6 +21,7 @@ import {
   ThrowingProvider,
 } from '../support/test-providers.js';
 import { countByStatus, eventually, runUntilSettled } from '../support/worker-helpers.js';
+import { startWebhookReceiver } from '../support/webhook-receiver.js';
 
 /** Retries become due almost at once, so a test can run a job to its end state quickly. */
 const FAST_RETRIES = { BASE_RETRY_DELAY_MS: '1', MAX_RETRY_DELAY_MS: '2' };
@@ -358,6 +361,84 @@ describe('Worker (PostgreSQL)', () => {
     });
   });
 
+  describe('failure before and after the provider call', () => {
+    it('refunds the attempt when processing fails before the provider is called', async () => {
+      const provider = new AlwaysSuccessProvider();
+      const worker = await startWorker(provider);
+      const rateLimit = app?.get(RateLimitService);
+      if (!rateLimit) throw new Error('app not started');
+      const admit = jest
+        .spyOn(rateLimit, 'admit')
+        .mockRejectedValueOnce(new Error('connection reset'));
+      const { job: j } = await jobs.insertIfAbsent(newJob({ maxAttempts: 1 }));
+
+      await worker.poll();
+      await worker.whenIdle();
+
+      const handedBack = await job(j.id);
+      expect([handedBack.status, handedBack.attemptCount]).toEqual([JobStatus.Pending, 0]);
+      expect(provider.calls).toHaveLength(0);
+
+      admit.mockRestore();
+      await runUntilSettled(worker, dataSource);
+      expect((await job(j.id)).status).toBe(JobStatus.Sent);
+    });
+
+    it('does not send a job that was reclaimed while it waited in the local queue', async () => {
+      const provider = new RecordingProvider(200);
+      const worker = await startWorker(provider, {
+        WORKER_CONCURRENCY: '1',
+        WORKER_BATCH_SIZE: '2',
+      });
+      const first = await jobs.insertIfAbsent(newJob({ priority: JobPriority.High }));
+      const waiting = await jobs.insertIfAbsent(newJob({ priority: JobPriority.Low }));
+      await worker.poll();
+
+      // While the first delivery runs, the queued job's claim expires and
+      // another worker takes it.
+      await dataSource.query(
+        `UPDATE notification_jobs SET locked_at = now() - interval '10 minutes' WHERE id = $1`,
+        [waiting.job.id],
+      );
+      await jobs.recoverStaleClaims(300, 100);
+      const other = await jobs.claimDueJobs('worker-b', 1);
+      await worker.whenIdle();
+
+      expect(provider.calls.map((c) => c.deliveryKey)).toEqual([first.job.id]);
+      const reclaimed = await job(waiting.job.id);
+      expect([reclaimed.status, reclaimed.lockedBy, reclaimed.claimToken]).toEqual([
+        JobStatus.Processing,
+        'worker-b',
+        other.claimToken,
+      ]);
+    });
+
+    it('reconciles a final attempt the provider accepted before the worker died', async () => {
+      const worker = await startWorker(undefined, { JOB_VISIBILITY_TIMEOUT_SECONDS: '60' });
+      const { job: j } = await jobs.insertIfAbsent(newJob({ maxAttempts: 1 }));
+      await jobs.claimDueJobs('worker-a', 1);
+      await dataSource.query(
+        `INSERT INTO mock_provider_deliveries (delivery_key, recipient, channel) VALUES ($1, $2, $3)`,
+        [j.id, j.recipient, j.channel],
+      );
+      await dataSource.query(
+        `UPDATE notification_jobs SET locked_at = now() - interval '2 minutes' WHERE id = $1`,
+        [j.id],
+      );
+
+      await app?.get(WorkerRecoveryService).recoverStale();
+      await runUntilSettled(worker, dataSource);
+
+      const settled = await job(j.id);
+      expect([settled.status, settled.attemptCount]).toEqual([JobStatus.Sent, 2]);
+      const [{ count }]: { count: string }[] = await dataSource.query(
+        'SELECT count(*) FROM mock_provider_deliveries WHERE delivery_key = $1',
+        [j.id],
+      );
+      expect(count).toBe('1');
+    });
+  });
+
   describe('scheduler', () => {
     it('polls and delivers on its own when APP_ROLE=worker, and drains on shutdown', async () => {
       const provider = new AlwaysSuccessProvider();
@@ -366,6 +447,31 @@ describe('Worker (PostgreSQL)', () => {
 
       await eventually(async () => (await job(j.id)).status === JobStatus.Sent);
       expect(provider.calls).toHaveLength(1);
+    });
+
+    it('lets an in-flight webhook dispatch finish before closing the pool', async () => {
+      const receiver = await startWebhookReceiver(() => 200, 400);
+      try {
+        await startWorker(new AlwaysSuccessProvider(), {
+          APP_ROLE: 'worker',
+          WORKER_POLL_INTERVAL_MS: '20',
+          WEBHOOK_URL: receiver.url,
+          WEBHOOK_POLL_INTERVAL_MS: '20',
+        });
+        const { job: j } = await jobs.insertIfAbsent(newJob());
+        await eventually(() => Promise.resolve(receiver.received.length === 1));
+
+        await app?.close();
+        app = undefined;
+
+        const [event]: { delivered_at: Date | null }[] = await dataSource.query(
+          'SELECT delivered_at FROM webhook_events WHERE job_id = $1',
+          [j.id],
+        );
+        expect(event.delivered_at).toBeInstanceOf(Date);
+      } finally {
+        await receiver.close();
+      }
     });
 
     it('does not poll when APP_ROLE=api', async () => {

@@ -13,6 +13,7 @@ import {
 import { MAX_SCHEDULE_AHEAD_SECONDS } from '../../common/constants/job.constants.js';
 import { JobPriority } from '../../common/enums/job-priority.enum.js';
 import { NotificationChannel } from '../../common/enums/notification-channel.enum.js';
+import { NoNullCharacters } from '../../common/validators/no-null-characters.validator.js';
 import { IsSendAt } from './validators/is-send-at.validator.js';
 
 export class ScheduleNotificationDto {
@@ -24,6 +25,7 @@ export class ScheduleNotificationDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(320)
+  @NoNullCharacters()
   recipient: string;
 
   @ApiProperty({
@@ -41,6 +43,7 @@ export class ScheduleNotificationDto {
     example: { subject: 'Welcome', body: 'Welcome to Notify Queue' },
   })
   @IsObject()
+  @NoNullCharacters()
   payload: Record<string, unknown>;
 
   @ApiPropertyOptional({
@@ -81,5 +84,6 @@ export class ScheduleNotificationDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(255)
+  @NoNullCharacters()
   idempotencyKey: string;
 }

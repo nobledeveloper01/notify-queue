@@ -20,6 +20,10 @@ export class JobClaimService {
     return this.jobs.claimDueJobs(this.workerId, batchSize);
   }
 
+  start(jobId: string, claimToken: string): Promise<boolean> {
+    return this.jobs.startAttempt(jobId, claimToken);
+  }
+
   release(jobId: string, claimToken: string): Promise<boolean> {
     return this.jobs.releaseClaim(jobId, claimToken);
   }

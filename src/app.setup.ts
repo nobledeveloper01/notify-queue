@@ -1,6 +1,9 @@
+import { ConfigService } from '@nestjs/config';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { JSON_BODY_LIMIT, REQUEST_ID_HEADER } from './common/constants/app.constants.js';
+import type { AppConfig } from './config/configuration.js';
+import { AppRole } from './config/env.validation.js';
 
 export const SWAGGER_PATH = 'api/docs';
 
@@ -17,6 +20,14 @@ export const configureApp = (app: NestExpressApplication): void => {
   // skips, so the last log lines (including the worker's drain report) would
   // be lost under load. It also makes a clean shutdown exit 0 instead of 143.
   app.enableShutdownHooks([], { useProcessExit: true });
+
+  // Swagger mounts straight onto Express, outside Nest's middleware, so the
+  // worker-role route restriction cannot filter it; a worker simply does not
+  // register it.
+  const role = app.get<ConfigService<AppConfig, true>>(ConfigService).get('role', { infer: true });
+  if (role === AppRole.Worker) {
+    return;
+  }
 
   const document = SwaggerModule.createDocument(
     app,

@@ -1,7 +1,9 @@
+import { jest } from '@jest/globals';
 import type { INestApplication } from '@nestjs/common';
 import type { DataSource } from 'typeorm';
 import { JobStatus } from '../../src/common/enums/job-status.enum.js';
 import { NotificationJobRepository } from '../../src/notifications/repositories/notification-job.repository.js';
+import { WebhookEventRepository } from '../../src/webhooks/repositories/webhook-event.repository.js';
 import { WebhookService } from '../../src/webhooks/webhook.service.js';
 import { newJob } from '../support/job.factory.js';
 import { createTestApp } from '../support/test-app.js';
@@ -133,6 +135,23 @@ describe('Webhook dispatch (HTTP + PostgreSQL)', () => {
     expect(event.failed_at).toBeInstanceOf(Date);
     expect(event.last_error).toBe('ECONNREFUSED');
     expect((await jobs.findById(job.id))?.status).toBe(JobStatus.Sent);
+  });
+
+  it('does not count a failure to record a delivery as a failed delivery', async () => {
+    const receiver = await startWebhookReceiver();
+    closeReceiver = receiver.close;
+    const webhooks = await startDispatcher(receiver.url, { WEBHOOK_MAX_ATTEMPTS: '1' });
+    const events = app?.get(WebhookEventRepository);
+    if (!events) throw new Error('app not started');
+    jest.spyOn(events, 'markDelivered').mockRejectedValueOnce(new Error('connection reset'));
+    const job = await sendJob();
+
+    const report = await webhooks.dispatchDue();
+
+    expect(report).toEqual({ delivered: 1, retrying: 0, givenUp: 0 });
+    const event = await eventFor(job.id);
+    // Not given up, although this was its only allowed attempt: it was delivered.
+    expect([event.failed_at, event.last_error]).toEqual([null, null]);
   });
 
   it('does not dispatch when WEBHOOK_URL is unset, but keeps the event for later', async () => {

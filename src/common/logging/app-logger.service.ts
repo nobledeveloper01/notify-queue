@@ -51,7 +51,11 @@ export class AppLogger implements LoggerService {
     if (message instanceof Error) {
       this.pino[level]({ ...base, err: message }, message.message);
     } else if (typeof message === 'object' && message !== null) {
-      this.pino[level]({ ...base, ...(message as Record<string, unknown>) });
+      const fields = message as Record<string, unknown>;
+      // Always pass a message: given none, pino copies `err.message` into
+      // `msg`, which for a database error can quote input values.
+      const msg = typeof fields.event === 'string' ? fields.event : 'err' in fields ? 'error' : '';
+      this.pino[level]({ ...base, ...fields }, msg);
     } else {
       this.pino[level](base, String(message));
     }
