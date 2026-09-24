@@ -92,8 +92,20 @@ export class EnvironmentVariables {
   WORKER_POLL_INTERVAL_MS: number = 1000;
 
   @IsInt()
+  @Min(1000)
+  WORKER_RECOVERY_INTERVAL_MS: number = 30000;
+
+  @IsInt()
+  @Min(0)
+  WORKER_SHUTDOWN_TIMEOUT_MS: number = 30000;
+
+  @IsInt()
   @Min(1)
   JOB_VISIBILITY_TIMEOUT_SECONDS: number = 300;
+
+  @IsInt()
+  @Min(1)
+  PROVIDER_TIMEOUT_MS: number = 10000;
 
   @IsInt()
   @Min(1)
@@ -111,6 +123,10 @@ export class EnvironmentVariables {
   @Min(0)
   @Max(1)
   MOCK_FAILURE_RATE: number = 0.2;
+
+  @IsInt()
+  @Min(0)
+  MOCK_LATENCY_MS: number = 50;
 
   @IsInt()
   @Min(1)
@@ -153,6 +169,14 @@ export const validateEnv = (raw: Record<string, string | undefined>): Environmen
   if (env.BASE_RETRY_DELAY_MS > env.MAX_RETRY_DELAY_MS) {
     throw new Error(
       'Invalid environment configuration:\n  - BASE_RETRY_DELAY_MS must not exceed MAX_RETRY_DELAY_MS',
+    );
+  }
+
+  // A provider call that outlives the lease would let recovery hand the job
+  // to a second worker while the first is still sending it.
+  if (env.PROVIDER_TIMEOUT_MS >= env.JOB_VISIBILITY_TIMEOUT_SECONDS * 1000) {
+    throw new Error(
+      'Invalid environment configuration:\n  - PROVIDER_TIMEOUT_MS must be shorter than JOB_VISIBILITY_TIMEOUT_SECONDS',
     );
   }
 

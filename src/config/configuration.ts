@@ -16,7 +16,15 @@ export interface WorkerConfig {
   concurrency: number;
   batchSize: number;
   pollIntervalMs: number;
+  recoveryIntervalMs: number;
+  shutdownTimeoutMs: number;
   visibilityTimeoutSeconds: number;
+}
+
+export interface DeliveryConfig {
+  providerTimeoutMs: number;
+  mockFailureRate: number;
+  mockLatencyMs: number;
 }
 
 export interface RetryConfig {
@@ -39,7 +47,7 @@ export interface AppConfig {
   worker: WorkerConfig;
   retry: RetryConfig;
   rateLimit: RateLimitConfig;
-  mockFailureRate: number;
+  delivery: DeliveryConfig;
   webhookUrl?: string;
 }
 
@@ -64,6 +72,8 @@ export const buildConfig = (env: EnvironmentVariables): AppConfig => ({
     concurrency: env.WORKER_CONCURRENCY,
     batchSize: env.WORKER_BATCH_SIZE,
     pollIntervalMs: env.WORKER_POLL_INTERVAL_MS,
+    recoveryIntervalMs: env.WORKER_RECOVERY_INTERVAL_MS,
+    shutdownTimeoutMs: env.WORKER_SHUTDOWN_TIMEOUT_MS,
     visibilityTimeoutSeconds: env.JOB_VISIBILITY_TIMEOUT_SECONDS,
   },
   retry: {
@@ -75,7 +85,11 @@ export const buildConfig = (env: EnvironmentVariables): AppConfig => ({
     maxNotifications: env.RATE_LIMIT_MAX_NOTIFICATIONS,
     windowSeconds: env.RATE_LIMIT_WINDOW_SECONDS,
   },
-  mockFailureRate: env.MOCK_FAILURE_RATE,
+  delivery: {
+    providerTimeoutMs: env.PROVIDER_TIMEOUT_MS,
+    mockFailureRate: env.MOCK_FAILURE_RATE,
+    mockLatencyMs: env.MOCK_LATENCY_MS,
+  },
   webhookUrl: env.WEBHOOK_URL,
 });
 

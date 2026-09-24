@@ -2,12 +2,14 @@ import { Module, RequestMethod } from '@nestjs/common';
 import type { MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_PIPE } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter.js';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware.js';
 import { createValidationPipe } from './common/pipes/validation.pipe.js';
 import { configuration } from './config/configuration.js';
 import { DatabaseModule } from './database/database.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
+import { WorkersModule } from './workers/workers.module.js';
 
 @Module({
   imports: [
@@ -16,8 +18,10 @@ import { NotificationsModule } from './notifications/notifications.module.js';
       cache: true,
       load: [configuration],
     }),
+    ScheduleModule.forRoot(),
     DatabaseModule,
     NotificationsModule,
+    WorkersModule,
   ],
   providers: [
     // Registered as providers (not in main.ts) so tests that build AppModule

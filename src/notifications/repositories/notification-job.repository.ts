@@ -211,6 +211,18 @@ export class NotificationJobRepository {
   }
 
   /**
+   * PROCESSING → PENDING without counting an attempt: for jobs a worker
+   * claimed but never started (it is shutting down). They are due again
+   * immediately rather than waiting out the lease.
+   */
+  releaseClaim(id: string, claimToken: string): Promise<boolean> {
+    return this.completeClaim(id, claimToken, JobStatus.Pending, {
+      attemptCount: () => 'attempt_count - 1',
+      nextAttemptAt: () => 'now()',
+    });
+  }
+
+  /**
    * Returns jobs whose lease expired (the owning worker crashed or hung) to
    * PENDING, or dead-letters them if the expired claim was their last attempt.
    *

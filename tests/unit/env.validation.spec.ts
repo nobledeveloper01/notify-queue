@@ -39,6 +39,16 @@ describe('validateEnv', () => {
     ).toThrow(/BASE_RETRY_DELAY_MS/);
   });
 
+  it('rejects a provider timeout that outlives the job lease', () => {
+    expect(() =>
+      validateEnv({
+        ...minimalEnv,
+        PROVIDER_TIMEOUT_MS: '300000',
+        JOB_VISIBILITY_TIMEOUT_SECONDS: '300',
+      }),
+    ).toThrow(/PROVIDER_TIMEOUT_MS/);
+  });
+
   it('accepts a compose-internal webhook host without a TLD', () => {
     const env = validateEnv({ ...minimalEnv, WEBHOOK_URL: 'http://api:3000/webhooks/mock' });
 

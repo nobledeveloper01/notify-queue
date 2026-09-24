@@ -1,8 +1,13 @@
+import type { INestApplication } from '@nestjs/common';
 import type { DataSource } from 'typeorm';
 import { JobStatus } from '../../src/common/enums/job-status.enum.js';
 import { NotificationJobRepository } from '../../src/notifications/repositories/notification-job.repository.js';
+import { WorkerService } from '../../src/workers/worker.service.js';
 import { newJob } from '../support/job.factory.js';
+import { createTestApp } from '../support/test-app.js';
 import { createTestDataSource, truncateAll } from '../support/test-database.js';
+import { RecordingProvider } from '../support/test-providers.js';
+import { countByStatus } from '../support/worker-helpers.js';
 
 /**
  * Each simulated worker gets its own DataSource (its own connection pool), as
@@ -137,5 +142,76 @@ describe('duplicate delivery under concurrent workers (PostgreSQL)', () => {
     const results = await Promise.all(workers.map(naiveClaim));
 
     expect(results.filter(Boolean).length).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * The spec's scenario end to end: ten complete worker applications (each its
+ * own Nest app, worker ID and connection pool) sharing one provider, polling
+ * at the same moment. Checked on both sides: the database, and how many
+ * times the provider was actually called.
+ */
+describe('duplicate delivery with 10 real worker applications (PostgreSQL)', () => {
+  let admin: DataSource;
+  let jobs: NotificationJobRepository;
+  let provider: RecordingProvider;
+  let apps: INestApplication[];
+  let workers: WorkerService[];
+
+  beforeAll(async () => {
+    admin = await createTestDataSource();
+    jobs = new NotificationJobRepository(admin);
+    provider = new RecordingProvider(5);
+    apps = [];
+    for (let i = 0; i < WORKER_COUNT; i++) {
+      apps.push(
+        await createTestApp({
+          provider,
+          listen: false,
+          env: { WORKER_ID: `app-worker-${i}`, DATABASE_POOL_MAX: '3', WORKER_CONCURRENCY: '5' },
+        }),
+      );
+    }
+    workers = apps.map((a) => a.get(WorkerService));
+  });
+
+  afterAll(async () => {
+    await Promise.all(apps.map((a) => a.close()));
+    await admin.destroy();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(admin);
+    provider.calls.length = 0;
+  });
+
+  it('1 job, 10 workers polling simultaneously: 1 provider call, 1 delivery', async () => {
+    const { job } = await jobs.insertIfAbsent(newJob());
+
+    const polls = await Promise.all(workers.map((w) => w.poll()));
+    await Promise.all(workers.map((w) => w.whenIdle()));
+
+    expect(polls.map((p) => p.claimed).reduce((a, b) => a + b)).toBe(1);
+    expect(provider.calls.map((c) => c.deliveryKey)).toEqual([job.id]);
+    const sent = await jobs.findById(job.id);
+    expect([sent?.status, sent?.attemptCount]).toEqual([JobStatus.Sent, 1]);
+  });
+
+  it('300 jobs across 10 workers: exactly 300 provider calls, all SENT on the first attempt', async () => {
+    await Promise.all(Array.from({ length: 300 }, () => jobs.insertIfAbsent(newJob())));
+
+    for (let round = 0; round < 50; round++) {
+      const polls = await Promise.all(workers.map((w) => w.poll()));
+      await Promise.all(workers.map((w) => w.whenIdle()));
+      if (polls.every((p) => p.claimed === 0)) break;
+    }
+
+    expect(provider.calls).toHaveLength(300);
+    expect(new Set(provider.calls.map((c) => c.deliveryKey)).size).toBe(300);
+    expect(await countByStatus(admin)).toEqual({ SENT: 300 });
+    const [{ max }]: { max: number }[] = await admin.query(
+      'SELECT max(attempt_count) FROM notification_jobs',
+    );
+    expect(max).toBe(1);
   });
 });
