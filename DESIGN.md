@@ -28,6 +28,7 @@ This document explains how Notify Queue works and why it is built the way it is.
 21. [Trade-offs](#21-trade-offs)
 22. [Future improvements](#22-future-improvements)
 23. [Design questions, answered](#23-design-questions-answered)
+24. [Simplifying assumptions](#24-simplifying-assumptions)
 
 ---
 
@@ -465,6 +466,23 @@ It keeps its `last_error`, `attempt_count` and `dead_lettered_at`, emits a webho
 counted in `/metrics` (`deadLettered`), and is **never retried automatically**. The table
 *is* the dead-letter queue: a dead job can be inspected with SQL and fetched by ID.
 
+### Poison messages
+
+A poison message is a job that can never succeed, and the risk is that it retries forever,
+wasting capacity or taking workers down with it. Each kind ends in a terminal state after
+bounded work:
+
+| Kind | Example | What happens |
+| --- | --- | --- |
+| Invalid at the door | Malformed schedule, unknown channel, NUL characters, oversized body | Rejected with 400 before it becomes a job |
+| Permanently rejected by the provider | Bad recipient address | FAILED on the first attempt; no retries |
+| Always fails transiently | A provider that times out for this job every time | Retried with backoff, then DEAD_LETTERED after `MAX_RETRIES + 1` attempts |
+| Crashes or hangs the worker | A payload that makes the process die mid-delivery | The attempt is counted when the job is claimed, so every crash uses one up. After the lease expires, recovery requeues it; the final attempt gets one reconciliation retry; then it is DEAD_LETTERED. It cannot cycle forever, and the other jobs in that worker's batch are recovered normally |
+
+A provider timeout (`PROVIDER_TIMEOUT_MS`) and error containment in `DeliveryService`
+mean a misbehaving provider call surfaces as an ordinary retryable failure instead of
+taking the worker down.
+
 FAILED is kept distinct from DEAD_LETTERED on purpose. FAILED means the provider said no
 (retrying cannot help); DEAD_LETTERED means the provider kept failing (retrying later
 might). An operator treats them differently. A manual redrive endpoint is listed under
@@ -668,6 +686,16 @@ responds to a ping within 1.5 s. The container health checks use it.
 - **Secrets** come from the environment only, are validated at boot, and are never logged.
 - **Least privilege in the container.** The runtime image has no dev dependencies and
   runs as the non-root `node` user.
+- **HTTP hardening.** Helmet sets the standard security headers and removes
+  `X-Powered-By`. API responses carry a Content-Security-Policy that allows nothing
+  (they are JSON); the Swagger UI gets one that permits only its own inline bootstrap code.
+- **Network exposure in Compose.** PostgreSQL is published on `127.0.0.1` only, so the
+  demo credentials are not reachable from the local network. Workers publish no port.
+- **Dependencies.** `npm audit` reports no known vulnerabilities.
+- **Demo-only surfaces.** `POST /webhooks/mock` is an unauthenticated demo receiver that
+  writes to its own table; it would not exist in production, where the webhook target is a
+  customer's endpoint. The Swagger UI is public, which suits an assessment but would sit
+  behind authentication or be disabled in production.
 - **Out of scope for the assessment, and needed in production:** API authentication,
   HMAC-signed webhooks, TLS to PostgreSQL, and a least-privilege database role (the app
   needs DML only; migrations need DDL).
@@ -812,3 +840,25 @@ the same instant and fail together again. Jitter spreads them out.
 
 **Why rate-limit in PostgreSQL?** Workers are distributed. The limit is a global property
 of a recipient, and local memory cannot represent global state.
+
+## 24. Simplifying assumptions
+
+Where the brief left room, or where a production system would need more, these are the
+assumptions made, why each is reasonable here, and what changes in production.
+
+| Assumption | Why it is reasonable here | In production |
+| --- | --- | --- |
+| **The provider honours idempotency keys.** The exactly-once *delivery* claim rests on it (section 10). | Most real email, SMS and push APIs accept one, and the mock implements it faithfully (shared state, not per process) | Use each provider's idempotency key; where one has none, the honest guarantee is at-least-once |
+| **The provider is a mock** with a configurable random transient failure rate, and permanent rejection for recipients starting `invalid`. | The brief asks for a stub sender with simulated failures | Real providers behind the same interface, one per channel |
+| **PostgreSQL is the only infrastructure**: queue, locks, rate-limit store and outbox. | One dependency to run and reason about, with transactional guarantees across all of them; it scales further than most systems need | Unchanged until the write rate outgrows one primary (section 19) |
+| **Jobs fire at or after their scheduled time**, within about one poll interval (1 s by default). | Notifications tolerate second-level latency | Shorter poll interval or `LISTEN/NOTIFY` wake-ups for tighter timing |
+| **Priority is strict** among due jobs: a steady stream of HIGH jobs can hold LOW jobs back indefinitely. | The brief asks for high before low whenever both are due | Add aging (effective priority rises with wait time) or reserve a share of each batch for lower priorities |
+| **Recipient identity is the string as given.** `A@example.com` and `a@example.com` are different recipients for rate limiting, and addresses are not validated per channel. | Normalisation rules differ by channel and provider | Normalise per channel (lower-case emails, E.164 phone numbers) before storing |
+| **One rate limit for everyone**: N per recipient per window, across all channels, counting admissions rather than successful deliveries. | Matches the brief's "N per recipient per hour"; counting admissions is the conservative choice | Per-channel or per-tenant limits; possibly count only successful sends |
+| **Webhooks fire for terminal states only** (SENT, FAILED, DEAD_LETTERED), to one global `WEBHOOK_URL`, unsigned. | These are the status changes the brief names | Per-tenant or per-job URLs, HMAC signatures, possibly PENDING/PROCESSING events |
+| **The dead-letter queue is a status**, not a separate table or topic, and there is no redrive endpoint. | A status is queryable, indexed and consistent with the job's history; redrive is an operator action outside the brief | An audited redrive endpoint (section 22) |
+| **No authentication or multi-tenancy.** | Out of scope for the brief | Authentication on every endpoint, tenant ID on every row, per-tenant quotas |
+| **Payloads are opaque JSON** up to 64 KB, not validated against a per-channel schema. | The system transports notifications; rendering them is the provider's job | Per-channel schemas (subject and body for email, length limits for SMS) |
+| **Scheduling horizon is 365 days**; a `sendAt` in the past is due immediately. | Guards against typos (year 2099) while tolerating client clock skew | Configurable per tenant |
+| **The database clock is authoritative** for every due time, lease and window. | Removes clock skew between worker machines from the correctness argument | Unchanged |
+

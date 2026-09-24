@@ -164,7 +164,7 @@ every problem.
 | `MOCK_FAILURE_RATE` | `0.2` | Chance the mock provider fails transiently |
 | `MOCK_LATENCY_MS` | `50` | Mock provider latency |
 | `RATE_LIMIT_MAX_NOTIFICATIONS` / `RATE_LIMIT_WINDOW_SECONDS` | `10` / `3600` | Per-recipient limit |
-| `WEBHOOK_URL` | demo receiver | Status-change webhook target; empty disables dispatch |
+| `WEBHOOK_URL` | demo receiver | Status-change webhook target; empty disables dispatch. It points at the API's own demo receiver, so if you run the API on another port, change it too |
 | `WEBHOOK_TIMEOUT_MS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_POLL_INTERVAL_MS` | `5000` / `10` / `1000` | Webhook delivery |
 
 ## Database setup
@@ -216,7 +216,8 @@ or `npm run start:dev` for watch mode with the API and a worker in one process.
 npm run start:worker       # APP_ROLE=worker
 ```
 
-A worker polls for due jobs, delivers them, recovers stale claims and dispatches webhooks.
+A worker polls for due jobs, delivers them, recovers stale claims and dispatches webhooks
+(to `WEBHOOK_URL`, which by default is the API's demo receiver on port 3000).
 Over HTTP it answers only `/health` and `/metrics` (anything else is a 404). On SIGTERM it
 stops claiming, returns unstarted jobs to the queue, and waits up to
 `WORKER_SHUTDOWN_TIMEOUT_MS` for running deliveries.
@@ -456,9 +457,13 @@ as the demo receiver does.
   worker to poll during a burst can claim up to 100 jobs while others find little. Lower
   `WORKER_BATCH_SIZE` spreads bursts more evenly.
 - **Webhooks are not signed.** Production would add an HMAC signature header.
+- **Demo surfaces are public**: `POST /webhooks/mock` and the Swagger UI have no
+  authentication.
 - **No authentication** on the API; it is out of scope for the assessment.
 - **Priority is not preemptive**: a HIGH job created after a worker's batch was claimed
   waits for that worker's next poll.
+- **Priority is strict**: under a sustained stream of HIGH jobs, LOW jobs can wait
+  indefinitely. Aging would fix it (DESIGN.md, section 24).
 
 ## Scaling strategy
 

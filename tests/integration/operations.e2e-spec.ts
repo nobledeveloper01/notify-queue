@@ -96,6 +96,23 @@ describe('Operations endpoints and logging (HTTP + PostgreSQL)', () => {
     });
   });
 
+  describe('security headers', () => {
+    it('sends hardening headers and hides the framework on API responses', async () => {
+      const res = await http.get('/metrics').expect(200);
+
+      expect(res.headers['x-powered-by']).toBeUndefined();
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
+      expect(res.headers['content-security-policy']).toContain("default-src 'none'");
+    });
+
+    it('gives the Swagger UI a policy that lets it load', async () => {
+      const res = await http.get('/api/docs').expect(200);
+
+      expect(res.headers['content-security-policy']).toContain("script-src 'self' 'unsafe-inline'");
+    });
+  });
+
   describe('worker role', () => {
     it('answers only /health and /metrics', async () => {
       const worker = await createTestApp({
