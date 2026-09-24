@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import type { AppConfig } from '../config/configuration.js';
 import { NotificationJobRepository } from '../notifications/repositories/notification-job.repository.js';
 import type { RecoveryOutcome } from '../notifications/repositories/notification-job.repository.js';
+import { RateLimitService } from '../rate-limit/rate-limit.service.js';
 
 const RECOVERY_BATCH = 500;
 
@@ -24,6 +25,7 @@ export class WorkerRecoveryService {
 
   constructor(
     private readonly jobs: NotificationJobRepository,
+    private readonly rateLimit: RateLimitService,
     config: ConfigService<AppConfig, true>,
   ) {
     const worker = config.get('worker', { infer: true });
@@ -41,6 +43,10 @@ export class WorkerRecoveryService {
         this.visibilityTimeoutSeconds,
         RECOVERY_BATCH,
       );
+      // Housekeeping on the same cadence: reservations older than the window
+      // can no longer affect any admission decision.
+      await this.rateLimit.pruneExpired();
+
       if (outcome.requeued.length > 0 || outcome.deadLettered.length > 0) {
         this.logger.warn({
           workerId: this.workerId,

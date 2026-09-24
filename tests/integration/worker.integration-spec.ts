@@ -201,6 +201,77 @@ describe('Worker (PostgreSQL)', () => {
     });
   });
 
+  describe('rate limiting', () => {
+    it('defers jobs over the recipient limit without spending an attempt', async () => {
+      const provider = new AlwaysSuccessProvider();
+      const worker = await startWorker(provider, {
+        RATE_LIMIT_MAX_NOTIFICATIONS: '2',
+        RATE_LIMIT_WINDOW_SECONDS: '3600',
+      });
+      await Promise.all(
+        Array.from({ length: 5 }, () =>
+          jobs.insertIfAbsent(newJob({ recipient: 'busy@example.com' })),
+        ),
+      );
+      const other = await jobs.insertIfAbsent(newJob({ recipient: 'quiet@example.com' }));
+
+      await worker.poll();
+      await worker.whenIdle();
+
+      expect(await countByStatus(dataSource)).toEqual({ SENT: 3, PENDING: 3 });
+      expect((await job(other.job.id)).status).toBe(JobStatus.Sent);
+      const deferred: { attempt_count: number; wait_s: string }[] = await dataSource.query(
+        `SELECT attempt_count, extract(epoch FROM next_attempt_at - now()) AS wait_s
+           FROM notification_jobs WHERE status = 'PENDING'`,
+      );
+      for (const row of deferred) {
+        expect(row.attempt_count).toBe(0);
+        expect(Number(row.wait_s)).toBeGreaterThan(3590);
+      }
+      expect(provider.calls.filter((c) => c.recipient === 'busy@example.com')).toHaveLength(2);
+    });
+
+    it('delivers a deferred job once its slot frees', async () => {
+      const worker = await startWorker(new AlwaysSuccessProvider(), {
+        RATE_LIMIT_MAX_NOTIFICATIONS: '1',
+        RATE_LIMIT_WINDOW_SECONDS: '1',
+      });
+      const first = await jobs.insertIfAbsent(newJob({ recipient: 'busy@example.com' }));
+      const second = await jobs.insertIfAbsent(newJob({ recipient: 'busy@example.com' }));
+
+      await worker.poll();
+      await worker.whenIdle();
+      expect((await job(second.job.id)).status).toBe(JobStatus.Pending);
+
+      await eventually(async () => {
+        await worker.poll();
+        await worker.whenIdle();
+        return (await job(second.job.id)).status === JobStatus.Sent;
+      }, 4000);
+      expect((await job(first.job.id)).status).toBe(JobStatus.Sent);
+      expect((await job(second.job.id)).attemptCount).toBe(1);
+    });
+
+    it('prunes reservations once they are outside the window', async () => {
+      const worker = await startWorker(new AlwaysSuccessProvider(), {
+        RATE_LIMIT_WINDOW_SECONDS: '1',
+      });
+      await jobs.insertIfAbsent(newJob());
+      await worker.poll();
+      await worker.whenIdle();
+      await dataSource.query(
+        `UPDATE rate_limit_reservations SET reserved_at = now() - interval '5 seconds'`,
+      );
+
+      await app?.get(WorkerRecoveryService).recoverStale();
+
+      const [{ count }]: { count: string }[] = await dataSource.query(
+        'SELECT count(*) FROM rate_limit_reservations',
+      );
+      expect(count).toBe('0');
+    });
+  });
+
   describe('graceful shutdown', () => {
     it('finishes running deliveries and hands unstarted jobs straight back', async () => {
       const provider = new RecordingProvider(150);

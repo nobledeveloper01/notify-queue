@@ -105,7 +105,7 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
 
       expect(second.created).toBe(false);
       expect(second.job.id).toBe(first.job.id);
-      expect(second.job.recipient).toBe('user@example.com');
+      expect(second.job.recipient).toBe(first.job.recipient);
     });
   });
 

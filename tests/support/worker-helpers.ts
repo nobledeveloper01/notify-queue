@@ -2,7 +2,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { DataSource } from 'typeorm';
 import type { WorkerService } from '../../src/workers/worker.service.js';
 
-export const countByStatus = async (dataSource: DataSource): Promise<Record<string, number>> => {
+export const countByStatus = async (
+  dataSource: DataSource,
+): Promise<Partial<Record<string, number>>> => {
   const rows: { status: string; count: string }[] = await dataSource.query(
     'SELECT status, count(*) FROM notification_jobs GROUP BY status',
   );

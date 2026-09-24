@@ -7,7 +7,7 @@ import type { NewNotificationJob } from '../../src/notifications/repositories/no
 export const newJob = (overrides: Partial<NewNotificationJob> = {}): NewNotificationJob => ({
   idempotencyKey: `test-${randomUUID()}`,
   requestFingerprint: randomUUID().replaceAll('-', '').padEnd(64, '0'),
-  recipient: 'user@example.com',
+  recipient: `user-${randomUUID()}@example.com`,
   channel: NotificationChannel.Email,
   payload: { subject: 'Hello', body: 'World' },
   priority: JobPriority.Normal,

@@ -223,6 +223,23 @@ export class NotificationJobRepository {
   }
 
   /**
+   * PROCESSING → PENDING until `until`, without counting an attempt: the
+   * recipient is over its rate limit, so nothing was tried.
+   */
+  deferRateLimited(id: string, claimToken: string, until: Date): Promise<boolean> {
+    return this.completeClaim(
+      id,
+      claimToken,
+      JobStatus.Pending,
+      {
+        attemptCount: () => 'attempt_count - 1',
+        nextAttemptAt: () => ':until',
+      },
+      { until },
+    );
+  }
+
+  /**
    * Returns jobs whose lease expired (the owning worker crashed or hung) to
    * PENDING, or dead-letters them if the expired claim was their last attempt.
    *

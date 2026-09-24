@@ -3,11 +3,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DeliveryService } from '../delivery/delivery.service.js';
 import type { NotificationJob } from '../notifications/entities/notification-job.entity.js';
 import { NotificationJobRepository } from '../notifications/repositories/notification-job.repository.js';
+import { RateLimitService } from '../rate-limit/rate-limit.service.js';
 import { RetryService } from '../retry/retry.service.js';
 import { JobClaimService } from './job-claim.service.js';
 
 /**
  * Takes one claimed job through one delivery attempt and records the outcome.
+ * A recipient over its rate limit is not an attempt: the job goes back to the
+ * queue, due when a slot frees, with its attempt refunded.
  * Runs with no database transaction or lock held: the claim committed before
  * this starts, and each outcome is its own short, token-fenced UPDATE.
  */
@@ -17,6 +20,7 @@ export class JobProcessorService {
 
   constructor(
     private readonly delivery: DeliveryService,
+    private readonly rateLimit: RateLimitService,
     private readonly retry: RetryService,
     private readonly jobs: NotificationJobRepository,
     private readonly claims: JobClaimService,
@@ -28,6 +32,17 @@ export class JobProcessorService {
     const context = { workerId: this.claims.workerId, jobId: job.id, attempt: job.attemptCount };
 
     try {
+      const admission = await this.rateLimit.admit(job);
+      if (!admission.allowed) {
+        const recorded = await this.jobs.deferRateLimited(job.id, claimToken, admission.retryAt);
+        this.logger.log({
+          ...context,
+          event: recorded ? 'job.rate_limited' : 'job.claim_lost',
+          retryAt: admission.retryAt.toISOString(),
+        });
+        return;
+      }
+
       const result = await this.delivery.deliver(job);
       const durationMs = Math.round(performance.now() - started);
 
