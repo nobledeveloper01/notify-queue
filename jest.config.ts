@@ -14,6 +14,11 @@ const config: Config = {
   transform: {
     [String.raw`^.+\.ts$`]: ['ts-jest', { useESM: true, tsconfig: 'tsconfig.json' }],
   },
+  // Integration and concurrency suites share one test database and truncate
+  // it; running files serially keeps them from wiping each other's rows.
+  // Concurrency *within* a test is real: each simulated worker has its own pool.
+  maxWorkers: 1,
+  testTimeout: 30_000,
   clearMocks: true,
   restoreMocks: true,
 };

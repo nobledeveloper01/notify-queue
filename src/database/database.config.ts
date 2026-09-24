@@ -1,6 +1,6 @@
-import { join } from 'node:path';
 import type { DataSourceOptions } from 'typeorm';
 import type { DatabaseConfig } from '../config/configuration.js';
+import { migrations } from './migrations/index.js';
 
 /**
  * Connection options shared by the Nest application and the TypeORM CLI, so
@@ -18,7 +18,7 @@ export const buildDataSourceOptions = (db: DatabaseConfig): DataSourceOptions =>
   password: db.password,
   synchronize: false,
   migrationsRun: false,
-  migrations: [join(import.meta.dirname, 'migrations', '*.js')],
+  migrations,
   migrationsTableName: 'typeorm_migrations',
   extra: {
     max: db.poolMax,

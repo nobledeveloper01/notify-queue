@@ -1,6 +1,6 @@
-import { join } from 'node:path';
 import { DataSource } from 'typeorm';
 import { configuration } from '../config/configuration.js';
+import { NotificationJob } from '../notifications/entities/notification-job.entity.js';
 import { buildDataSourceOptions } from './database.config.js';
 
 /**
@@ -9,5 +9,5 @@ import { buildDataSourceOptions } from './database.config.js';
  */
 export default new DataSource({
   ...buildDataSourceOptions(configuration().database),
-  entities: [join(import.meta.dirname, '..', '**', '*.entity.js')],
+  entities: [NotificationJob],
 });

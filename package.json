@@ -20,8 +20,8 @@
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest tests/unit",
-    "test:integration": "NODE_OPTIONS=--experimental-vm-modules jest tests/integration --passWithNoTests",
-    "test:concurrency": "NODE_OPTIONS=--experimental-vm-modules jest tests/concurrency --passWithNoTests",
+    "test:integration": "NODE_OPTIONS=--experimental-vm-modules jest tests/integration",
+    "test:concurrency": "NODE_OPTIONS=--experimental-vm-modules jest tests/concurrency",
     "migration:run": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js",
     "migration:revert": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:revert -d dist/database/data-source.js",
     "migration:show": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:show -d dist/database/data-source.js"
