@@ -1,275 +1,179 @@
 # Notify Queue
 
-A distributed, delayed notification queue built on PostgreSQL. Clients schedule a
-notification for a time or after a delay; any number of worker processes claim due jobs
-without ever handing one job to two workers, deliver them through a pluggable provider,
-retry failures with exponential backoff, dead-letter what cannot be delivered, respect a
-per-recipient rate limit, and report every final outcome to a webhook.
+Notify Queue is a service that **sends notifications (email, text message or app alerts)
+at the right time, exactly once**, even when many copies of it run side by side and
+things go wrong.
 
-PostgreSQL is the only infrastructure: it is the queue, the lock manager, the rate-limit
-store and the webhook outbox. The design is explained in [DESIGN.md](DESIGN.md).
+A business tells it "send this message to this person at 9 am tomorrow" or "send this in
+ten minutes". Notify Queue keeps the message until it is due, then sends it. It handles
+the awkward cases: a delivery service that is briefly down, the same request arriving
+twice, a computer crashing half-way through, or one person being sent too many messages
+in an hour.
+
+- **How it works, in plain language:** [DESIGN.md](DESIGN.md)
+- **Full technical design, for engineers:** [docs/technical-design.md](docs/technical-design.md)
 
 ## Contents
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Folder structure](#folder-structure)
-- [Requirements](#requirements)
-- [Environment setup](#environment-setup)
-- [Database setup](#database-setup)
-- [Migrations](#migrations)
-- [Seed](#seed)
-- [Running the API](#running-the-api)
-- [Running a worker](#running-a-worker)
-- [Running multiple workers](#running-multiple-workers)
-- [Docker](#docker)
-- [Swagger](#swagger)
-- [API examples](#api-examples)
-- [Testing](#testing)
-- [Concurrency testing](#concurrency-testing)
-- [Retry behaviour](#retry-behaviour)
-- [Rate limiting](#rate-limiting)
-- [Exactly-once semantics](#exactly-once-semantics)
+- [What it can do](#what-it-can-do)
+- [How it fits together](#how-it-fits-together)
+- [What you need](#what-you-need)
+- [Getting it running](#getting-it-running)
+- [Running several workers](#running-several-workers)
+- [Running everything with Docker](#running-everything-with-docker)
+- [Using it](#using-it)
+- [Interactive API documentation](#interactive-api-documentation)
+- [Checking that it works (tests)](#checking-that-it-works-tests)
+- [Settings](#settings)
+- [How the tricky parts are handled](#how-the-tricky-parts-are-handled)
 - [Known limitations](#known-limitations)
-- [Scaling strategy](#scaling-strategy)
+- [Where things are in the code](#where-things-are-in-the-code)
 
-## Features
+## What it can do
 
-- **Scheduling** at an absolute time (`sendAt`, ISO 8601 with an offset) or after a delay
-  (`delaySeconds`); exactly one of the two is required.
-- **Idempotent API**: repeating a request with the same `idempotencyKey` and body returns
-  the original job (200); reusing a key for a different body is rejected (409). Safe under
-  concurrent duplicates, enforced by a unique constraint.
-- **Distributed workers** that claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, scale
-  horizontally, and never hold a lock while talking to the outside world.
-- **Priorities** (HIGH, NORMAL, LOW) honoured when claiming.
-- **Bounded concurrency** per worker, and a cap on how much work one worker may hold.
-- **Retries** with exponential backoff and jitter; **dead-lettering** once retries run out;
-  permanent provider errors fail immediately.
-- **Crash recovery**: a job whose worker died is returned to the queue after a visibility
-  timeout. A fencing token stops the original worker from overwriting the new owner's result.
-- **Idempotent delivery**: every attempt of a job uses the same delivery key, so a job
-  recovered after its provider call succeeded is not sent twice.
-- **Per-recipient rate limit** over a sliding window, shared by all workers through
-  PostgreSQL. Waiting for the limit does not use up an attempt.
-- **Webhooks** for SENT, FAILED and DEAD_LETTERED via a transactional outbox: delivered at
-  least once, with retries, deduplicable by event ID.
-- **Operator actions**: cancel a pending job, list jobs by status or recipient (including
-  the dead-letter queue), and redrive dead-lettered or failed jobs, with an audit trail.
-- **Graceful shutdown**: workers stop claiming, finish running deliveries, and hand
-  unstarted jobs straight back to the queue.
-- **Operations**: `/health` (application and PostgreSQL), `/metrics` (queue depth, queue
-  lag, webhook backlog), structured JSON logs with request IDs and worker fields, and
-  notification payloads never logged.
-- **OpenAPI** documentation at `/api/docs`.
+- **Schedule** a notification for a specific time, or for a number of seconds from now.
+- **Send urgent ones first.** Each notification is HIGH, NORMAL or LOW priority.
+- **Never send one twice**, even with many senders working at once and computers
+  crashing.
+- **Ignore repeated requests.** The same request sent twice creates one notification.
+- **Retry failures** with growing pauses, and **set aside** ones that keep failing (the
+  "dead-letter queue") instead of retrying forever.
+- **Limit messages per person**: at most 10 per rolling hour by default. Extra ones wait
+  their turn instead of failing.
+- **Send status updates** (webhooks) to the business's own system when a notification is
+  sent, fails, or is set aside.
+- **Let you look things up**: one notification's status, lists by status or by
+  recipient, and overall numbers.
+- **Let you step in**: cancel a notification that has not been sent yet, or re-try one that
+  was set aside.
 
-## Architecture
+## How it fits together
 
 ```
-                         ┌──────────────┐
-    HTTP clients ──────▶ │     API      │  APP_ROLE=api
-                         └──────┬───────┘
-                                │ INSERT … ON CONFLICT (idempotency_key) DO NOTHING
-                                ▼
-                      ┌────────────────────┐
-                      │     PostgreSQL     │  jobs · rate-limit reservations · webhook outbox
-                      └────────────────────┘
-                        ▲        ▲        ▲
-      FOR UPDATE        │        │        │   token-fenced status updates
-      SKIP LOCKED       │        │        │
-                   ┌────┴───┐┌───┴────┐┌──┴─────┐
-                   │ Worker ││ Worker ││ Worker │  APP_ROLE=worker, scaled horizontally
-                   └───┬────┘└───┬────┘└───┬────┘
-                       │         │         │
-                       ▼         ▼         ▼
-             Notification provider      Webhook endpoint
-             (idempotent on delivery key)  (at-least-once, dedupe by eventId)
+ Businesses ──▶  API (front desk)  ──▶  Database (the ledger)  ◀──  Workers (couriers) ──▶ Email / SMS / push
+                 takes requests         every notification           pick up due messages
+                                        and its status               and send them
 ```
 
-One image runs every role; `APP_ROLE` selects `api`, `worker` or `all` (both, for local
-development).
+- The **API** accepts requests and answers questions.
+- The **database** (PostgreSQL) is the single, shared record of everything.
+- **Workers** pick up notifications that are due and send them. You can run as many as
+  you like; they coordinate only through the database.
 
-Every feature follows the same layering:
+The same program plays either role. A setting called `APP_ROLE` decides whether a copy is
+the front desk (`api`), a courier (`worker`), or both (`all`, handy on a laptop).
 
-```
-Controller → DTO validation → Service → Repository → PostgreSQL
-```
+## What you need
 
-Controllers handle HTTP only, services hold the business rules, and repositories are the
-only code that touches the database. The worker side follows the same rule:
+- **Node.js** version 22.13 or newer (the program's runtime)
+- **npm** (comes with Node.js)
+- **Docker**, to run the database (or the whole system) without installing it by hand
 
-```
-WorkerScheduler → WorkerService → JobClaimService → NotificationJobRepository
-                                → JobProcessorService → RateLimitService
-                                                      → DeliveryService → NotificationProvider
-                                                      → RetryService
-```
+## Getting it running
 
-## Folder structure
+Run these commands from the project folder, one at a time.
 
-```
-src/
-├── main.ts, app.module.ts, app.setup.ts
-├── config/           validated environment, typed configuration
-├── common/           enums, constants, DTOs, exception filter, request-id and request-logging
-│                     middleware, validation pipe, pino logger, idempotency fingerprint
-├── database/         connection options, migrations, seed runner, raw-query helper
-├── notifications/    API: controller, DTOs, service, repository, entity, state machine
-├── workers/          scheduler, worker loop, claiming, processing, stale-claim recovery
-├── delivery/         provider interface, mock provider, delivery service with timeout
-├── retry/            backoff policy, failure handling
-├── rate-limit/       sliding-window limiter and its repository
-├── webhooks/         outbox dispatcher, demo receiver
-├── metrics/          SQL-aggregated queue metrics
-└── health/           terminus health check
-tests/
-├── unit/             pure logic: policies, validation, service rules, logger
-├── integration/      real PostgreSQL: repository, HTTP API, worker, webhooks, operations
-├── concurrency/      real PostgreSQL races: claiming, idempotency, rate limit, webhook dispatch
-└── support/          test app factory, deterministic providers, fixtures
-```
-
-## Requirements
-
-- Node.js 22.13 or newer (the Docker image uses Node 24)
-- npm
-- Docker with Compose v2 (for PostgreSQL, or for the whole stack)
-
-## Environment setup
+**1. Install the program's building blocks.**
 
 ```bash
 npm ci
+```
+
+**2. Create your settings file** from the example. The defaults work as they are.
+
+```bash
 cp .env.example .env
 ```
 
-`.env.example` documents every variable. The defaults point the app at the Compose
-PostgreSQL on host port **5434** (chosen to avoid clashing with a local PostgreSQL on 5432).
-All variables are validated at startup; a bad value stops the process with a list of
-every problem.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `APP_ROLE` | `all` | `api`, `worker`, or `all` |
-| `PORT` | `3000` | HTTP port (a worker serves only `/health` and `/metrics` on it) |
-| `LOG_LEVEL` | `info` | pino level; `NODE_ENV=development` prints human-readable logs |
-| `DATABASE_*` | see file | PostgreSQL connection; `DATABASE_POOL_MAX` sizes the pool |
-| `WORKER_ID` | random UUID | Stable name for a worker in logs and claims |
-| `WORKER_CONCURRENCY` | `10` | Deliveries one worker runs at once |
-| `WORKER_BATCH_SIZE` | `100` | Most claimed-but-unfinished jobs one worker may hold |
-| `WORKER_POLL_INTERVAL_MS` | `1000` | Wait between polls when the queue is idle |
-| `WORKER_RECOVERY_INTERVAL_MS` | `30000` | How often stale claims are recovered |
-| `WORKER_SHUTDOWN_TIMEOUT_MS` | `30000` | How long shutdown waits for running deliveries |
-| `JOB_VISIBILITY_TIMEOUT_SECONDS` | `300` | A claim older than this is presumed dead |
-| `PROVIDER_TIMEOUT_MS` | `10000` | Cap on one provider call; must be below the visibility timeout |
-| `MAX_RETRIES` | `5` | Retries after the first attempt (6 attempts in total) |
-| `BASE_RETRY_DELAY_MS` / `MAX_RETRY_DELAY_MS` | `1000` / `60000` | Backoff range |
-| `MOCK_FAILURE_RATE` | `0.2` | Chance the mock provider fails transiently |
-| `MOCK_LATENCY_MS` | `50` | Mock provider latency |
-| `RATE_LIMIT_MAX_NOTIFICATIONS` / `RATE_LIMIT_WINDOW_SECONDS` | `10` / `3600` | Per-recipient limit |
-| `WEBHOOK_URL` | demo receiver | Status-change webhook target; empty disables dispatch. It points at the API's own demo receiver, so if you run the API on another port, change it too |
-| `WEBHOOK_TIMEOUT_MS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_POLL_INTERVAL_MS` | `5000` / `10` / `1000` | Webhook delivery |
-
-## Database setup
+**3. Start the database.** This runs PostgreSQL in Docker on port 5434, chosen so it
+does not clash with a database you may already have on the usual port.
 
 ```bash
 docker compose up -d postgres
 ```
 
-This starts PostgreSQL 17 with a health check. On first start it also creates
-`notify_queue_test`, the database the test suites use. Tests refuse to run against any
-database whose name does not end in `_test`.
-
-## Migrations
-
-The schema is owned by hand-written migrations; `synchronize` is off everywhere.
+**4. Create the database tables.**
 
 ```bash
-npm run migration:run      # apply pending migrations
-npm run migration:show     # list applied and pending
-npm run migration:revert   # undo the most recent one
+npm run migration:run
 ```
 
-Each command builds first, then runs the TypeORM CLI against the compiled
-`dist/database/data-source.js` with the same validated configuration the app uses.
-
-## Seed
+**5. (Optional) Load example notifications**, covering every interesting case: urgent and
+low-priority messages, one scheduled for later, one mid-retry, one set aside, a busy
+recipient who will hit the hourly limit, and more. Running it twice does no harm.
 
 ```bash
 npm run seed
 ```
 
-Loads [`seed.sql`](seed.sql): an immediate job, a delayed job, one job at each priority,
-twelve jobs for one recipient (over the default limit of ten, so the rate limit shows),
-a job part-way through its retries, a job that will fail permanently, and one historical
-job in each final state. It is idempotent: running it again inserts nothing new.
+**6. Start it.** This runs the front desk and a worker together, and restarts when the
+code changes.
 
-## Running the API
+```bash
+npm run start:dev
+```
+
+The service is now at **http://localhost:3000**, with interactive documentation at
+**http://localhost:3000/api/docs**.
+
+## Running several workers
+
+To see several couriers sharing the work, run the front desk on its own, then start as
+many workers as you like, each in its own terminal window:
 
 ```bash
 npm run build
-npm run start:api          # APP_ROLE=api
+npm run start:api
 ```
-
-or `npm run start:dev` for watch mode with the API and a worker in one process.
-
-## Running a worker
-
-```bash
-npm run start:worker       # APP_ROLE=worker
-```
-
-A worker polls for due jobs, delivers them, recovers stale claims and dispatches webhooks
-(to `WEBHOOK_URL`, which by default is the API's demo receiver on port 3000).
-Over HTTP it answers only `/health` and `/metrics` (anything else is a 404). On SIGTERM it
-stops claiming, returns unstarted jobs to the queue, and waits up to
-`WORKER_SHUTDOWN_TIMEOUT_MS` for running deliveries.
-
-## Running multiple workers
-
-Workers need nothing but the database, so start as many as you like, each with its own
-port and (optionally) its own name:
 
 ```bash
 PORT=3001 WORKER_ID=worker-1 npm run start:worker
+```
+
+```bash
 PORT=3002 WORKER_ID=worker-2 npm run start:worker
+```
+
+```bash
 PORT=3003 WORKER_ID=worker-3 npm run start:worker
 ```
 
-## Docker
+Each worker needs its own `PORT` (it answers health checks there) and can have a
+`WORKER_ID` so you can tell them apart in the logs. When a worker is stopped (Ctrl+C),
+it finishes the messages it is sending, hands back the ones it had not started, and
+exits.
+
+## Running everything with Docker
+
+One command starts the database, the front desk and a worker:
 
 ```bash
-docker compose up --build                   # PostgreSQL, one API, one worker
-docker compose up --build --scale worker=3  # three workers
-docker compose --profile seed run --rm seed # load the demo data
+docker compose up --build
 ```
 
-The stack runs a one-shot `migrate` service first; the API and workers start only after it
-succeeds, so replicas never race to apply the same migration. Containers run as a non-root
-user under an init process, so `docker compose stop` delivers SIGTERM and workers drain
-cleanly (their grace period is longer than the drain timeout). Webhooks are pointed at the
-API's demo receiver.
+Three workers instead of one:
 
-If port 3000 is taken on your machine: `API_HOST_PORT=3100 docker compose up --build`.
+```bash
+docker compose up --build --scale worker=3
+```
 
-## Swagger
+Load the example notifications into it:
 
-Interactive documentation: **http://localhost:3000/api/docs**
-(OpenAPI JSON at `/api/docs-json`), served by API instances (`APP_ROLE=api` or `all`).
+```bash
+docker compose --profile seed run --rm seed
+```
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/notifications` | Schedule a notification |
-| `GET` | `/notifications` | List jobs, newest first; filter by `status`, `recipient`; cursor pagination |
-| `GET` | `/notifications/:id` | A job's status and history |
-| `DELETE` | `/notifications/:id` | Cancel a job that is still PENDING |
-| `POST` | `/notifications/:id/retry` | Redrive a DEAD_LETTERED or FAILED job with a fresh attempt budget |
-| `GET` | `/metrics` | Queue depth, queue lag, webhook backlog |
-| `GET` | `/health` | Application and PostgreSQL health |
-| `POST` | `/webhooks/mock` | Demo webhook receiver |
+If port 3000 is already taken on your computer, choose another:
+`API_HOST_PORT=3100 docker compose up --build`. Workers cannot be reached from outside,
+and the database can be reached only from your own computer (port 5434), never from the
+network.
 
-## API examples
+## Using it
 
-Schedule a notification in 60 seconds:
+The examples use `curl`, a command-line tool for talking to web services. The same
+requests can be made from the interactive documentation page instead.
+
+**Schedule a notification** to go out in 60 seconds:
 
 ```bash
 curl -s -X POST http://localhost:3000/notifications \
@@ -284,225 +188,192 @@ curl -s -X POST http://localhost:3000/notifications \
   }'
 ```
 
-`201 Created`:
+- `channel` is `EMAIL`, `SMS` or `PUSH`.
+- Use either `delaySeconds` (send after this many seconds) **or** `sendAt` (send at this
+  exact time, such as `"2026-09-27T12:00:00Z"`), not both.
+- `idempotencyKey` is your own unique order number for this notification. Sending the
+  same request again with the same key does not create a second notification.
 
-```json
-{
-  "id": "3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c",
-  "idempotencyKey": "welcome-user-123",
-  "recipient": "user@example.com",
-  "channel": "EMAIL",
-  "priority": "HIGH",
-  "status": "PENDING",
-  "scheduledAt": "2026-09-24T12:01:00.000Z",
-  "nextAttemptAt": "2026-09-24T12:01:00.000Z",
-  "attemptCount": 0,
-  "maxAttempts": 6,
-  "lastError": null,
-  "sentAt": null,
-  "failedAt": null,
-  "deadLetteredAt": null,
-  "createdAt": "2026-09-24T12:00:00.000Z",
-  "updatedAt": "2026-09-24T12:00:00.000Z"
-}
-```
+The reply includes the notification's `id` (its tracking number) and `"status": "PENDING"`.
 
-Sending the same request again returns `200 OK` with the same job and the header
-`Idempotent-Replayed: true`. The same key with a different body returns `409 Conflict`.
-
-Schedule for an absolute time instead:
-
-```bash
-curl -s -X POST http://localhost:3000/notifications \
-  -H 'Content-Type: application/json' \
-  -d '{"recipient":"+2348012345678","channel":"SMS","payload":{"body":"Your code is 4829"},
-       "priority":"NORMAL","sendAt":"2026-09-27T12:00:00Z","idempotencyKey":"otp-4829"}'
-```
-
-Check on it, and look at the queue:
+**Check on it** using that id:
 
 ```bash
 curl -s http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c
-curl -s http://localhost:3000/metrics
-curl -s http://localhost:3000/health
 ```
 
-Cancel it while it is still PENDING (409 once a worker has picked it up):
+Its `status` moves from `PENDING` (waiting) to `PROCESSING` (being sent) to `SENT`.
+If sending goes wrong it may instead end as `FAILED` (can never be delivered) or
+`DEAD_LETTERED` (kept failing, set aside). If you cancelled it, it shows `CANCELLED`.
+
+**List notifications**, newest first. Filter by status, by recipient, or both:
+
+```bash
+curl -s 'http://localhost:3000/notifications?status=DEAD_LETTERED'
+curl -s 'http://localhost:3000/notifications?recipient=user@example.com'
+```
+
+Long lists come in pages. Each page includes a `nextCursor`; pass it back as
+`&cursor=…` to get the next page.
+
+**Cancel** a notification that has not been sent yet:
 
 ```bash
 curl -s -X DELETE http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c
 ```
 
-Work the dead-letter queue: list it, then send a job back with a fresh attempt budget:
+**Re-try** one that was set aside or failed, with a fresh set of attempts:
 
 ```bash
-curl -s 'http://localhost:3000/notifications?status=DEAD_LETTERED&limit=20'
 curl -s -X POST http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c/retry
 ```
 
-Lists return `{ "items": [...], "nextCursor": "…" }`; pass `cursor=<nextCursor>` for the
-next page (`null` on the last one). Filters combine: `?recipient=user@example.com&status=SENT`.
-
-Every error has the same shape, and every response carries an `X-Request-ID` (yours, if
-you sent one):
-
-```json
-{
-  "statusCode": 400,
-  "error": "Bad Request",
-  "message": "Validation failed",
-  "details": [{ "field": "sendAt", "errors": ["Provide exactly one of sendAt or delaySeconds"] }],
-  "path": "/notifications",
-  "requestId": "5b0e8f9c-7a51-4e0a-b4c9-2f1d3e6a7b8c"
-}
-```
-
-## Testing
-
-The integration and concurrency suites run against real PostgreSQL (the
-`notify_queue_test` database), so start it first:
+**See the overall numbers**, and check the service is healthy:
 
 ```bash
-docker compose up -d postgres
-npm test                  # everything
-npm run test:unit         # no database needed
-npm run test:integration
-npm run test:concurrency
-npm run lint
-npm run typecheck
+curl -s http://localhost:3000/metrics
+curl -s http://localhost:3000/health
 ```
 
-Tests never depend on chance. Test providers (`AlwaysSuccessProvider`, `AlwaysFailProvider`,
-`FailNTimesProvider`, `RecordingProvider`, plus hanging and throwing ones) replace the mock
-provider, and randomness (jitter, simulated failures) is injected so it can be pinned. The
-test suites share one database, so Jest runs files one at a time; the concurrency inside
-each test is real.
+### All the endpoints
 
-## Concurrency testing
-
-`tests/concurrency/` holds the races that matter, each against real PostgreSQL:
-
-| Test | Scenario | Checks |
+| Method | Address | What it does |
 | --- | --- | --- |
-| `duplicate-delivery` | 1 job, 10 complete worker apps polling at once; 300 jobs across 10 workers | Provider called exactly once per job; every job SENT on its first attempt |
-| `concurrent-idempotency` | 25 simultaneous identical POSTs; two different bodies racing for one key; 8 connection pools inserting at once | One job; exactly one 201; losers of a body race get 409 |
-| `concurrent-rate-limit` | 20 simultaneous admissions for one recipient; 10 workers competing over 40 jobs | Exactly N admitted; no sliding window ever exceeds N |
-| `webhook-dispatch` | 6 dispatchers claiming 60 events at once | Each event POSTed once |
-| `cancel-vs-claim` | 200 jobs cancelled while 5 workers claim them | Every job ends one way: cancelled and never claimed, or claimed and not cancelled |
+| `POST` | `/notifications` | Schedule a notification |
+| `GET` | `/notifications` | List notifications (filter by `status`, `recipient`) |
+| `GET` | `/notifications/{id}` | One notification's status and history |
+| `DELETE` | `/notifications/{id}` | Cancel it, if it has not started sending |
+| `POST` | `/notifications/{id}/retry` | Re-try one that was set aside or failed |
+| `GET` | `/metrics` | Counts by status, and how long the oldest waiting message has waited |
+| `GET` | `/health` | Whether the service and its database are working |
+| `POST` | `/webhooks/mock` | A pretend "business system" that receives status updates, for demonstrations |
 
-Each suite was also checked against a deliberately broken implementation (no
-`SKIP LOCKED`, no advisory lock, no `ON CONFLICT`, no fencing token) to confirm it fails
-when the guarantee is removed. A control test shows a naive read-then-update claim handing
-one job to several workers.
+### What the replies mean
 
-## Retry behaviour
+| Code | Meaning |
+| --- | --- |
+| `200` | OK. For a repeated schedule request, it means "already done; here is the original" |
+| `201` | Created: a new notification was scheduled |
+| `400` | Something in the request is wrong; the reply says what |
+| `404` | No notification with that id |
+| `409` | Not allowed right now: cancelling one that is already being sent, re-trying one that did not fail, or reusing an order number for different details |
 
-A failed attempt is classified by the provider:
+Every reply carries an `X-Request-ID` header. Quote it when reporting a problem; the same
+ID appears in the service's logs.
 
-- **Permanent** (for example, a rejected recipient): the job becomes `FAILED` at once.
-- **Retryable** (outage, timeout, unexpected error): the job returns to `PENDING`, due after
+## Interactive API documentation
 
-  ```
-  delay = min(BASE_RETRY_DELAY_MS × 2^(attempt−1), MAX_RETRY_DELAY_MS)
-  then jittered uniformly between half and all of that
-  ```
+Open **http://localhost:3000/api/docs** in a browser. It lists every endpoint with its
+fields and possible replies, and has a "Try it out" button to send real requests.
 
-  With the defaults: about 0.5–1 s, 1–2 s, 2–4 s, 4–8 s, 8–16 s.
-- When the last attempt (`MAX_RETRIES + 1`) fails, the job becomes `DEAD_LETTERED` and is
-  never retried automatically. An operator can list the dead-letter queue
-  (`GET /notifications?status=DEAD_LETTERED`) and send a job back with
-  `POST /notifications/:id/retry`; each redrive is counted on the job.
+## Checking that it works (tests)
 
-Attempts are counted when a job is claimed, so a job that crashes every worker that picks
-it up still runs out of attempts. Anything that stops a job before it reaches the provider
-(waiting for the rate limit, a shutdown hand-back, an error before sending) refunds the
-attempt.
+The tests need the database running (step 3 above). Then:
 
-One special case: if the claim on a job's **final** attempt expires, the worker may have
-died after the provider accepted the notification. Rather than dead-letter a notification
-that may have gone out, recovery grants one extra attempt, which resends with the same
-delivery key and settles it. Only if that attempt's claim expires too is the job
-dead-lettered.
-
-The mock provider fails transiently at `MOCK_FAILURE_RATE` and rejects any recipient
-starting with `invalid` permanently, so every path can be seen without code changes.
-
-## Rate limiting
-
-Each recipient may receive at most `RATE_LIMIT_MAX_NOTIFICATIONS` in any
-`RATE_LIMIT_WINDOW_SECONDS`, measured as a **sliding** window: there is no boundary at
-which twice the limit can slip through, as there would be with fixed windows.
-
-Admissions are recorded in `rate_limit_reservations` inside a short transaction that holds
-a PostgreSQL advisory lock on the recipient, so workers checking the same recipient take
-turns and cannot both see "one slot left". A job over the limit is not failed: it returns
-to `PENDING`, due exactly when the oldest admission leaves the window, with its attempt
-refunded. A retried or recovered job keeps the slot it already had.
-
-## Exactly-once semantics
-
-The system does **not** claim that PostgreSQL delivers exactly once. It provides:
-
-1. **Exclusive claiming**: a job is held by at most one worker at a time
-   (`FOR UPDATE SKIP LOCKED`, plus a per-claim fencing token).
-2. **Idempotent delivery**: every attempt at a job sends the same delivery key (the job ID).
-
-Together these give **one logical delivery per job**, provided the provider honours the
-delivery key. The window they close is this one:
-
-```
-Worker A: claim → send(deliveryKey) → provider accepts → ✗ crash before recording SENT
-Database: job still PROCESSING
-Later:    lease expires → job recovered → Worker B: send(same deliveryKey)
-Provider: "already delivered" → no second notification → Worker B records SENT
+```bash
+npm test
 ```
 
-Without the delivery key, that sequence sends the notification twice, and no queue design
-can prevent it on its own. The same resend also settles a crash on a job's *final*
-attempt: instead of being dead-lettered with its outcome unknown, the job gets one
-reconciliation attempt. The mock provider keeps its record of accepted keys in
-PostgreSQL, shared by every worker, as a real provider would; the integration suite
-reproduces exactly this crash.
+That runs every test. They are grouped:
 
-Webhooks are **at least once**: each carries a stable `eventId` (also in the
-`X-Webhook-Event-Id` header), and receivers should ignore IDs they have already processed,
-as the demo receiver does.
+| Group | What it checks | Run just this group |
+| --- | --- | --- |
+| Unit | Individual rules in isolation, such as how long to wait between retries | `npm run test:unit` |
+| Integration | Real behaviour against a real database: the API, workers, retries, webhooks | `npm run test:integration` |
+| Concurrency | The hard cases, with many things happening at once | `npm run test:concurrency` |
+
+The concurrency tests prove the headline promises under pressure:
+
+- **No duplicate sends:** ten workers grab for the same notification at the same moment,
+  repeatedly, and every time exactly one gets it. Three hundred notifications spread
+  across ten workers are each sent exactly once.
+- **No duplicate notifications:** twenty-five identical requests arriving together create
+  one notification.
+- **Rate limit holds:** ten workers competing to message one person never exceed the
+  limit.
+- **Status updates go out once each:** six senders working through sixty updates at once.
+- **Cancel versus send:** two hundred cancels racing workers; each notification ends one
+  way or the other, never both.
+
+Tests always use a separate test database, so they never touch your data. They never
+depend on luck: the random failures used in normal running are switched off, and failures
+are scripted instead.
+
+## Settings
+
+All settings live in the `.env` file. The example file explains each one, and the service
+refuses to start if a value is invalid, listing every problem. The ones you are most
+likely to change:
+
+| Setting | Default | What it controls |
+| --- | --- | --- |
+| `APP_ROLE` | `all` | `api` (front desk), `worker` (courier) or `all` (both) |
+| `PORT` | `3000` | The port the service listens on |
+| `WORKER_CONCURRENCY` | `10` | How many notifications one worker sends at the same time |
+| `WORKER_BATCH_SIZE` | `100` | How many notifications one worker may take at once |
+| `MAX_RETRIES` | `5` | Retries after the first try (so 6 attempts in total) |
+| `BASE_RETRY_DELAY_MS` / `MAX_RETRY_DELAY_MS` | `1000` / `60000` | The first pause before a retry, and the longest pause (in milliseconds) |
+| `MOCK_FAILURE_RATE` | `0.2` | How often the pretend delivery service fails at random (0.2 = 20%) |
+| `RATE_LIMIT_MAX_NOTIFICATIONS` / `RATE_LIMIT_WINDOW_SECONDS` | `10` / `3600` | At most 10 per person per hour |
+| `WEBHOOK_URL` | the pretend receiver | Where status updates are sent. It points at the front desk's own demo receiver on port 3000, so if you move the front desk to another port, change this too |
+| `JOB_VISIBILITY_TIMEOUT_SECONDS` | `300` | How long before a crashed worker's notifications are handed to another worker |
+
+The remaining settings (database connection, timeouts, log detail) are described in
+`.env.example`.
+
+## How the tricky parts are handled
+
+These are explained fully, in plain language, in [DESIGN.md](DESIGN.md). In short:
+
+- **Only one worker can take a notification.** Taking one locks it in the database in a
+  single step; other workers skip it and take the next.
+- **"Exactly once" delivery.** Every attempt at a notification uses the same reference
+  number. If a worker crashes right after sending, the retry reuses that number and the
+  delivery service recognises it, so the person gets one message. This relies on the
+  delivery service honouring reference numbers, as most real ones do.
+- **Retries.** Pauses double each time (½–1 s, then 1–2 s, then 2–4 s, and so on, up to one
+  minute), with a little randomness so failures do not all retry together.
+- **Dead-letter queue.** After six failed attempts a notification is set aside, kept with
+  its history, listed on request, and can be re-tried by hand.
+- **Rate limit.** Counted over the last sixty minutes from now, not per calendar hour, so
+  there is no double burst around the hour mark. Extra notifications wait for the next free
+  slot.
+- **Status updates.** Recorded in the same step as the status change, so a crash cannot
+  lose one; retried if the receiving system is down; each has an ID so a repeat can be
+  spotted.
 
 ## Known limitations
 
-- **The provider is a mock.** A real provider needs to support idempotency keys (most
-  email and SMS APIs do) for the delivery guarantee to hold end to end.
-- **Rate-limited backlogs churn.** Claiming does not know about rate limits, so a large
-  backlog for one busy recipient is claimed and deferred each time a slot frees. It is
-  correct but wasteful at scale (see DESIGN.md for the fix).
-- **Rate limits count admissions**, not successful deliveries: an attempt that then fails
-  still used its slot.
-- **Batch size trades fairness for throughput.** With the default batch of 100, the first
-  worker to poll during a burst can claim up to 100 jobs while others find little. Lower
-  `WORKER_BATCH_SIZE` spreads bursts more evenly.
-- **Webhooks are not signed.** Production would add an HMAC signature header.
-- **Demo surfaces are public**: `POST /webhooks/mock` and the Swagger UI have no
-  authentication.
-- **No authentication** on the API; it is out of scope for the assessment.
-- **Priority is not preemptive**: a HIGH job created after a worker's batch was claimed
-  waits for that worker's next poll.
-- **Priority is strict**: under a sustained stream of HIGH jobs, LOW jobs can wait
-  indefinitely. Aging would fix it (DESIGN.md, section 24).
+- **Sending is simulated.** A stand-in delivery service is used. Real services need to
+  support reference numbers for the "exactly once" promise to hold end to end.
+- **No logins.** Anyone who can reach the service can use it, including cancelling and
+  re-trying notifications. A real deployment would add authentication.
+- **Priority is strict.** A constant stream of urgent notifications could keep low-priority
+  ones waiting indefinitely.
+- **Work can be shared unevenly in bursts.** With the default batch size, the first worker
+  to look during a sudden burst can take up to 100 notifications while others find few. A
+  smaller `WORKER_BATCH_SIZE` spreads bursts more evenly.
+- **A very busy recipient causes extra work.** If thousands of notifications wait for one
+  person, workers keep checking and putting them back. The result is correct but wasteful.
+- **Status updates are not signed**, so a receiver cannot prove an update came from us. A
+  real deployment would add a signature.
 
-## Scaling strategy
+## Where things are in the code
 
-The short version: add workers until PostgreSQL becomes the constraint, then shrink what
-each worker asks of it, and only then reach for a dedicated broker. DESIGN.md walks
-through it from 1 to 1,000 workers and millions of jobs.
-
-- **Workers** are stateless and scale horizontally; `SKIP LOCKED` keeps them from
-  contending over rows.
-- **Batch claiming** turns N jobs into one query and one transaction.
-- **Partial indexes** keep the claim query touching only pending rows, however large the
-  history grows.
-- **Connection pooling** (PgBouncer in transaction mode) becomes necessary before workers
-  number in the hundreds.
-- **Partitioning** and archiving of finished jobs keep the hot table small.
-- **Queue sharding** or an external broker (SQS, RabbitMQ, Kafka) becomes worthwhile when
-  a single primary can no longer absorb the write rate, at a cost in operational
-  complexity and in the transactional guarantees PostgreSQL gives for free.
+```
+src/
+├── notifications/   the front desk: scheduling, looking up, listing, cancelling, re-trying
+├── workers/         the couriers: picking up due notifications and sending them
+├── delivery/        the connection to the (pretend) delivery service
+├── retry/           how long to wait, and when to give up
+├── rate-limit/      the per-person hourly limit
+├── webhooks/        status updates to other systems
+├── metrics/         the overall numbers
+├── health/          the health check
+├── database/        table definitions and the example data loader
+├── config/          the settings and their checks
+└── common/          shared pieces: error messages, logging, request IDs
+tests/               unit, integration and concurrency tests
+seed.sql             the example notifications
+docs/                the full technical design
+```
