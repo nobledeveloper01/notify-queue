@@ -145,7 +145,16 @@ exits.
 
 ## Running everything with Docker
 
-One command starts the database, the front desk and a worker:
+The quickest way, with short commands that are safe to copy:
+
+| Command | What it does |
+| --- | --- |
+| `npm run docker:up` | Builds and starts the database, the front desk and three workers |
+| `npm run docker:seed` | Loads the example notifications |
+| `npm run docker:logs` | Shows what the workers are doing (Ctrl+C to stop watching) |
+| `npm run docker:down` | Stops everything; your data is kept |
+
+The same thing with Docker directly. One command starts the database, the front desk and a worker:
 
 ```bash
 docker compose up --build

@@ -25,7 +25,11 @@
     "migration:run": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js",
     "migration:revert": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:revert -d dist/database/data-source.js",
     "migration:show": "npm run build && node --env-file-if-exists=.env ./node_modules/typeorm/cli.js migration:show -d dist/database/data-source.js",
-    "seed": "npm run build && node --env-file-if-exists=.env dist/database/seeds/run-seed.js"
+    "seed": "npm run build && node --env-file-if-exists=.env dist/database/seeds/run-seed.js",
+    "docker:up": "docker compose up --build -d --scale worker=3",
+    "docker:seed": "docker compose --profile seed run --rm seed",
+    "docker:logs": "docker compose logs -f worker",
+    "docker:down": "docker compose down"
   },
   "dependencies": {
     "@nestjs/axios": "^12.0.1",
