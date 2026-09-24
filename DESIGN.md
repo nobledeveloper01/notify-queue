@@ -1,387 +1,398 @@
-# Notify Queue: How It Works
+# Notify Queue: Design
 
-This document explains the design of Notify Queue in plain language. You do not need to
-be an engineer to follow it. Engineers who want the full technical detail (database
-queries, indexes, locking) will find it in
+This document explains how Notify Queue is designed and why. It is written in plain
+English. The full technical detail (SQL, indexes and locking) is in
 [docs/technical-design.md](docs/technical-design.md).
 
 ## Contents
 
-1. [What problem does this solve?](#1-what-problem-does-this-solve)
-2. [The big picture](#2-the-big-picture)
-3. [The life of one notification](#3-the-life-of-one-notification)
-4. [Never sending the same notification twice](#4-never-sending-the-same-notification-twice)
-5. [Urgent notifications go first](#5-urgent-notifications-go-first)
-6. [When sending fails: retries](#6-when-sending-fails-retries)
-7. [Giving up safely: the dead-letter queue](#7-giving-up-safely-the-dead-letter-queue)
-8. [Problem notifications ("poison messages")](#8-problem-notifications-poison-messages)
-9. [The same request sent twice](#9-the-same-request-sent-twice)
-10. [Not flooding one person: rate limiting](#10-not-flooding-one-person-rate-limiting)
-11. [Telling other systems what happened: webhooks](#11-telling-other-systems-what-happened-webhooks)
-12. [Checking on things: status, lists and numbers](#12-checking-on-things-status-lists-and-numbers)
-13. [Cancelling and re-trying by hand](#13-cancelling-and-re-trying-by-hand)
-14. [When things break](#14-when-things-break)
-15. [Growing to millions of notifications](#15-growing-to-millions-of-notifications)
-16. [Simplifying assumptions](#16-simplifying-assumptions)
-17. [Choices we made, and what they cost](#17-choices-we-made-and-what-they-cost)
-18. [A few words, explained](#18-a-few-words-explained)
+1. [Requirements](#1-requirements)
+2. [Architecture](#2-architecture)
+3. [The key decision: PostgreSQL is the queue](#3-the-key-decision-postgresql-is-the-queue)
+4. [The life of a notification](#4-the-life-of-a-notification)
+5. [Exactly-once delivery](#5-exactly-once-delivery)
+6. [Where race conditions could occur](#6-where-race-conditions-could-occur)
+7. [Priority](#7-priority)
+8. [Rate limiting](#8-rate-limiting)
+9. [Retries and backoff](#9-retries-and-backoff)
+10. [The dead-letter queue and poison messages](#10-the-dead-letter-queue-and-poison-messages)
+11. [Duplicate requests](#11-duplicate-requests)
+12. [Webhooks](#12-webhooks)
+13. [Scaling, and what breaks first](#13-scaling-and-what-breaks-first)
+14. [Simplifying assumptions](#14-simplifying-assumptions)
+15. [Trade-offs](#15-trade-offs)
+16. [Glossary](#16-glossary)
 
 ---
 
-## 1. What problem does this solve?
+## 1. Requirements
 
-Businesses constantly need to send messages at particular times: a reminder email the day
-before an appointment, a text message with a code, an app alert when an order ships.
-Notify Queue is a service that **holds messages until it is time to send them, then sends
-each one exactly once**. It works like a post office that keeps letters until their
-delivery date.
+Notify Queue must:
 
-It has to keep working when:
+- let a client schedule a notification (email, SMS or push) for a set time or after a delay;
+- deliver each notification **exactly once**, even with many workers running at the same time;
+- send HIGH-priority notifications before NORMAL and LOW ones when several are due;
+- retry failed deliveries with exponential backoff, up to a limit, and then move the
+  notification to a **dead-letter queue**;
+- handle **poison messages** (notifications that can never succeed) without looping forever;
+- ignore duplicate requests that use the same **idempotency key**;
+- limit how many notifications one recipient receives per hour, making extra notifications
+  wait instead of failing them;
+- call a **webhook** when a notification is sent, fails or is dead-lettered;
+- provide a status endpoint and a metrics endpoint.
 
-- **thousands of messages** fall due at the same moment;
-- **several copies of the sending program** run at once to keep up, and must not
-  trip over each other;
-- **the outside service** that actually delivers email or text messages is slow or down;
-- **a computer crashes** half-way through its work.
-
-## 2. The big picture
-
-There are three parts:
+## 2. Architecture
 
 ```
-   Businesses                     ┌────────────┐
-   send requests  ─────────────▶  │    API     │   the front desk: takes orders
-                                  └─────┬──────┘
-                                        ▼
-                                  ┌────────────┐
-                                  │  Database  │   the ledger: every notification
-                                  └─────┬──────┘   and its current status
-                           ┌────────────┼────────────┐
-                           ▼            ▼            ▼
-                      ┌────────┐   ┌────────┐   ┌────────┐
-                      │ Worker │   │ Worker │   │ Worker │   the couriers: pick up
-                      └────────┘   └────────┘   └────────┘   due messages and send them
-                           │            │            │
-                           ▼            ▼            ▼
-                    Email / SMS / push services, then a status report back to the business
+                         ┌────────────┐
+   Client requests ────▶ │    API     │
+                         └─────┬──────┘
+                               ▼
+                         ┌────────────┐
+                         │ PostgreSQL │   every notification, its status,
+                         └─────┬──────┘   the rate limits and the webhook events
+                ┌──────────────┼──────────────┐
+                ▼              ▼              ▼
+           ┌─────────┐    ┌─────────┐    ┌─────────┐
+           │ Worker  │    │ Worker  │    │ Worker  │
+           └────┬────┘    └────┬────┘    └────┬────┘
+                ▼              ▼              ▼
+          Email / SMS / Push provider, then a webhook call to the client
 ```
 
-- **The API (the front desk)** accepts requests like "send this email to Ada at 9 am
-  tomorrow". It checks the request, writes it into the ledger, and replies with a
-  tracking number (the job ID).
-- **The database (the ledger)** is the single record of every notification: what it is,
-  when it is due, and what has happened to it so far. It is the one thing everyone
-  shares, and it is where all the rules below are enforced.
-- **Workers (the couriers)** repeatedly ask the ledger "what is due now?", take some
-  messages, send them, and write down the result. You can run as many as you need.
-  They never talk to each other; they only talk to the ledger.
+The system has three parts:
 
-The ledger is a PostgreSQL database. It is the only piece of infrastructure the system
-needs.
+- **The API** receives requests, validates them and saves notifications to the database.
+  It never delivers anything itself.
+- **PostgreSQL** stores every notification and its current status. It is also the queue.
+- **Workers** repeatedly ask the database for notifications that are due, deliver them,
+  and record the result. Any number of workers can run. They never talk to each other,
+  only to the database, so adding capacity simply means starting more workers.
 
-## 3. The life of one notification
+The API and the workers are the same program, started in different roles. This means
+there is one thing to build, test and deploy, while the workers can still be scaled
+separately from the API.
 
-1. **Scheduled.** A business asks for an email to be sent at 9:00. The front desk records
-   it as **PENDING** (waiting) and hands back a tracking number.
-2. **Due.** At 9:00 the message becomes available to workers.
-3. **Claimed.** One worker takes it. The ledger now marks it **PROCESSING** and notes who
-   has it. No other worker can take it.
-4. **Sent.** The worker hands it to the email service, which accepts it. The ledger marks
-   it **SENT**.
-5. **Reported.** A status update ("message X was sent") goes back to the business's own
-   system.
+Inside the code, every feature follows the same three layers:
 
-When something goes wrong along the way, the notification may instead:
+- **Controllers** handle HTTP: they validate the request and call a service.
+- **Services** hold the business rules, such as when a notification is due or whether a
+  request is a duplicate.
+- **Repositories** are the only code that talks to the database.
 
-- **wait and try again** after a short pause (section 6);
-- end up **FAILED**, if the email service says it can never be delivered, for example
-  because the address does not exist;
-- end up **DEAD_LETTERED**, if it keeps failing and the retry limit is used up
-  (section 7);
-- be **CANCELLED**, if the business cancels it before it goes out (section 13).
+Keeping the database code in one layer makes the locking and transaction logic easy to
+review, and it lets the business rules be tested without a database.
 
-## 4. Never sending the same notification twice
+## 3. The key decision: PostgreSQL is the queue
 
-This is the most important promise, and it has two halves.
+I used PostgreSQL as the queue instead of adding a separate message broker such as
+RabbitMQ or Kafka. There are three reasons.
 
-### Half one: only one worker can take a message
+1. **It already has what a reliable queue needs.** Transactions, row locks and unique
+   constraints are exactly the tools needed to stop two workers taking the same
+   notification and to stop duplicate requests.
+2. **Related changes happen together.** When a notification is marked as sent, the webhook
+   event that reports it is saved in the same transaction. Either both are saved or
+   neither is. With a separate broker, they would live in two systems, and a crash between
+   the two writes could lose one of them.
+3. **It is simpler to run.** There is one system to operate and understand, and one
+   PostgreSQL server can handle thousands of notifications per second.
 
-Picture a deli counter where several staff serve from one queue of tickets. If two staff
-glanced at the queue at the same instant, both might call the same customer. Here, when
-a worker takes messages, the ledger **locks** them for that worker in a single step.
-Another worker looking at the same moment simply skips the locked ones and takes the
-next ones along. Every worker ends up with a different set of messages, with no waiting
-and no clashes.
+Section 13 explains when a dedicated broker would become worth adding.
 
-We test this directly. Ten workers grab for the same single message at the same instant,
-twenty-five times over, and every time exactly one gets it. We also show the opposite: a
-simpler approach without the lock hands one message to several workers.
-
-### Half two: a message sent just before a crash is not sent again
-
-There is one moment no queue can fully protect on its own:
+## 4. The life of a notification
 
 ```
-Worker takes the message → hands it to the email service → the email goes out
-→ the worker's computer crashes before it can write "SENT" in the ledger
+                         ┌──▶ SENT
+PENDING ──▶ PROCESSING ──┼──▶ FAILED          (the provider rejected it permanently)
+   ▲                     ├──▶ DEAD_LETTERED   (every attempt failed)
+   │                     │
+   └─────────────────────┘    temporary failure: back to PENDING to retry later
 ```
 
-The ledger still says "in progress". After a while (five minutes by default) the system
-assumes that worker is gone and gives the message to another worker, which would send it
-again.
+1. **PENDING:** the notification is saved and waiting until it is due.
+2. **PROCESSING:** a worker has claimed it. No other worker can take it.
+3. **SENT:** the provider accepted it.
 
-The fix is a **reference number that never changes** for each message, like a parcel
-tracking number. Every attempt at the same message uses the same reference. Email and
-text-message services remember the references they have already handled, so when the
-second worker sends it again, the service answers "already delivered, nothing to do",
-and the customer gets **one** email. The second worker then records it as SENT.
+Other possible outcomes:
 
-So the honest description of our guarantee is: **one worker at a time, plus a fixed
-reference number on every attempt, gives exactly one delivery**, as long as the delivery
-service honours reference numbers. Most real email and SMS services do. Our stand-in
-delivery service does too, and we test this exact crash.
+- **FAILED:** the provider rejected it permanently, for example because the address does
+  not exist. Retrying would not help.
+- **DEAD_LETTERED:** every attempt failed with a temporary error. It is set aside for an
+  operator to look at.
+- **CANCELLED:** the client cancelled it before it was sent.
 
-### A late worker cannot overwrite a newer result
+SENT, FAILED, DEAD_LETTERED and CANCELLED are final. The system never moves a notification
+out of these states on its own. Only an operator can send a FAILED or DEAD_LETTERED
+notification back to PENDING, using the retry endpoint.
 
-If a worker was merely slow rather than crashed, its claim expires and another worker
-takes over. Every claim carries a unique **claim ticket**, and the ledger only accepts a
-result from the worker holding the current ticket. The slow worker's late "sent" report
-is politely ignored rather than overwriting the new worker's result.
+## 5. Exactly-once delivery
 
-## 5. Urgent notifications go first
+This is the most important guarantee. It is achieved in two layers.
 
-Every notification is **HIGH**, **NORMAL** or **LOW** priority. When workers ask what is
-due, the ledger hands out high-priority messages first, then normal, then low. Within the
-same priority, the one that has waited longest goes first. It is the express lane at a
-supermarket: when several messages are due together, the urgent ones jump ahead.
+### Layer 1: only one worker can take a notification
 
-## 6. When sending fails: retries
+When a worker asks for due notifications, it uses a PostgreSQL feature called
+`SELECT ... FOR UPDATE SKIP LOCKED`. In plain terms, this means: "give me the next due
+notifications, lock them for me, and skip any that another worker has already locked."
 
-Delivery services have bad moments: a timeout, a brief outage. When a send fails for a
-reason that might clear up, the message goes back into the queue to try again later. Each
-wait is longer than the last:
+So if three workers ask at the same moment, each one receives a different set of
+notifications. No notification goes to two workers, and no worker has to wait for another.
 
-| After failure number | Waits roughly |
+The lock is held for only a few milliseconds. The worker marks the notifications as
+PROCESSING, records that it owns them, and releases the lock **before** it contacts the
+email or SMS provider. A database lock is never held while waiting for an outside
+service; otherwise, a slow provider would slow down the whole database.
+
+### Layer 2: a crash cannot cause a second delivery
+
+One risk remains, and no queue can remove it on its own:
+
+1. A worker sends an email, and the provider delivers it.
+2. The worker crashes before it can record that the email was sent.
+3. After five minutes, the system assumes the worker has died and gives the notification
+   to another worker.
+4. The second worker sends it again.
+
+To prevent a second email, every attempt at the same notification uses the same
+**idempotency key** with the provider: the notification's ID. The provider recognises a
+key it has already processed and does not send the email again. The customer receives one
+email, and the second worker records the notification as SENT.
+
+To be precise about the guarantee: the database ensures that only one worker holds a
+notification at any time, and the idempotency key ensures one delivery, **provided that
+the provider supports idempotency keys**. Most real email and SMS providers do. The
+simulated provider in this project does as well.
+
+### A slow worker cannot overwrite a newer result
+
+A worker might be slow rather than dead. If its claim expires, another worker takes over.
+Each claim has a unique **claim token**, and the database accepts a result only from the
+worker that holds the current token. When the slow worker finally reports back, its update
+is rejected, so it cannot overwrite the newer result.
+
+### How this is tested
+
+These tests run against a real PostgreSQL database:
+
+- 10 workers try to take the same notification at the same moment, 25 times in a row.
+  Exactly one worker succeeds every time.
+- 300 notifications are processed by 10 workers. The provider is called exactly 300 times.
+- A control test shows that a simpler approach without the lock gives one notification to
+  several workers.
+
+## 6. Where race conditions could occur
+
+| Situation | What could go wrong | What prevents it |
+| --- | --- | --- |
+| Two workers poll at the same moment | The same notification is delivered twice | `SKIP LOCKED` gives each worker different notifications |
+| A worker crashes after the provider delivered | A retry delivers a second copy | The same idempotency key is used on every attempt |
+| A slow worker finishes after another worker took over | The old result overwrites the new one | The claim token |
+| Two identical requests arrive at the same moment | Two notifications are created | A unique constraint on the idempotency key |
+| Two workers check the same recipient's rate limit | The limit is exceeded by one | A per-recipient lock during the check (section 8) |
+| A client cancels while a worker claims the notification | A cancelled notification is still sent | A single conditional update; only one of the two can succeed |
+| A crash happens between the status update and the webhook | The webhook is lost | Both are saved in one transaction |
+
+## 7. Priority
+
+Every notification is HIGH, NORMAL or LOW. When a worker asks for due notifications, it
+receives them in this order:
+
+1. highest priority first;
+2. within the same priority, the one that has been due the longest;
+3. then the one that was created first.
+
+For example, if a LOW newsletter, a NORMAL order confirmation and a HIGH password-reset
+code are all due, the password-reset code is sent first.
+
+The database keeps an index (a pre-sorted list) that contains only waiting notifications,
+already in this order. A worker reads from the top of that list instead of sorting the
+whole table, so claiming stays fast however many old notifications build up.
+
+## 8. Rate limiting
+
+Each recipient can receive at most **10 notifications in any rolling hour** (both numbers
+are configurable).
+
+- **Why the limit is stored in the database.** The workers are separate processes. A
+  counter in one worker's memory cannot know what the other workers have sent, so the
+  count must be shared.
+- **Why a rolling hour.** A limit that resets on the hour would allow 10 notifications at
+  12:59 and 10 more at 13:00: 20 in two minutes. A rolling hour counts the last 60 minutes
+  from the current moment, so that cannot happen.
+- **Extra notifications wait; they are not failed.** A notification over the limit goes
+  back to PENDING and becomes due at the exact moment a slot frees up. Waiting does not
+  use up any of its retry attempts.
+- **No race between workers.** If two workers check the same recipient at the same moment,
+  both might see "one slot left" and both send. To prevent this, each check briefly locks
+  that recipient, so the checks happen one after the other. Other recipients are not
+  affected.
+
+## 9. Retries and backoff
+
+When a delivery fails, the first question is whether trying again could help.
+
+- **Permanent failure** (for example, the address does not exist): the notification is
+  marked FAILED immediately. There is no point retrying.
+- **Temporary failure** (for example, the provider is down or does not respond in time):
+  the notification is retried later.
+
+Each retry waits about twice as long as the previous one:
+
+| After failed attempt | Wait before the next attempt |
 | --- | --- |
-| 1 | ½ to 1 second |
+| 1 | 0.5 to 1 second |
 | 2 | 1 to 2 seconds |
 | 3 | 2 to 4 seconds |
 | 4 | 4 to 8 seconds |
 | 5 | 8 to 16 seconds |
 
-(Waits never go above one minute, and all of these numbers can be changed.)
+The wait never exceeds one minute, and all of these values are configurable.
 
-- **Why wait longer each time?** If the service is struggling, hammering it with instant
-  retries makes things worse. Backing off gives it room to recover.
-- **Why "roughly"?** Suppose a hundred messages all failed together during one outage.
-  If every one retried at exactly the same moment, they would all hit the service at once
-  and probably all fail again. Adding a little randomness spreads them out.
+- **Why wait longer each time?** If the provider is struggling, retrying immediately makes
+  things worse. Longer waits give it time to recover.
+- **Why is there a range?** A random amount, called **jitter**, is added to each wait. If a
+  thousand notifications failed during the same outage, jitter stops them all retrying at
+  the same instant and overloading the provider again.
 
-By default a message gets **six attempts** in total: the first try plus five retries.
+By default, a notification gets **6 attempts** in total: the first attempt plus 5 retries.
 
-Some failures are never worth retrying, such as an email address that does not exist.
-Those are marked **FAILED** straight away.
+## 10. The dead-letter queue and poison messages
 
-## 7. Giving up safely: the dead-letter queue
+### The dead-letter queue
 
-When a message has used all its attempts and still failed, it is not retried forever and
-it is not thrown away. It is marked **DEAD_LETTERED** and set aside, like a post office's
-shelf of undeliverable mail.
+When a notification has used all 6 attempts, it is marked **DEAD_LETTERED**. It is not
+retried forever, and it is not deleted.
 
-- It keeps its full history: how many attempts, and the last error.
-- It shows up in the numbers (`/metrics`), and a status update is sent (section 11).
-- Anyone can **list** the set-aside messages.
-- An operator can **send one back** to try again (section 13), for example once an
-  outage is over.
+- It keeps its history: the number of attempts and the last error.
+- A webhook reports it, and it appears in the metrics.
+- An operator can list the dead-letter queue: `GET /notifications?status=DEAD_LETTERED`.
+- An operator can send it back with a fresh set of attempts, for example after an outage:
+  `POST /notifications/{id}/retry`. Each retry by an operator is recorded on the
+  notification.
 
-We keep FAILED and DEAD_LETTERED separate on purpose. FAILED means "the service said no",
-so something needs fixing first. DEAD_LETTERED means "the service kept being unavailable",
-so trying again later may well work.
+FAILED and DEAD_LETTERED are kept separate on purpose. FAILED means the provider rejected
+the notification, so something must be fixed first. DEAD_LETTERED means the provider kept
+failing, so trying again later may simply work.
 
-## 8. Problem notifications ("poison messages")
+### Poison messages
 
-A "poison message" is one that can never succeed. The danger is that it retries forever,
-or keeps crashing workers. Every kind ends somewhere safe:
+A poison message is a notification that can never succeed. The danger is that it retries
+forever or keeps crashing workers. Each kind is stopped:
 
-| Kind of problem | What happens |
+| Kind of poison message | What happens |
 | --- | --- |
-| The request itself is nonsense (bad date, unknown channel, far too large) | Rejected at the front desk; it never enters the queue |
-| The delivery service always refuses it | Marked FAILED after one try |
-| The delivery service keeps timing out on it | Retried with growing waits, then set aside as DEAD_LETTERED |
-| It crashes the worker that picks it up | Each crash still counts as a used attempt, so after a bounded number of crashes it is set aside as DEAD_LETTERED. Other messages that worker was holding are recovered and sent normally |
+| Invalid request (bad date, unknown channel, body too large) | Rejected with a 400 error; it never enters the queue |
+| The provider always rejects it | Marked FAILED after one attempt |
+| The provider always times out on it | Retried with backoff, then dead-lettered |
+| It crashes the worker every time | Dead-lettered after its attempts run out |
 
-## 9. The same request sent twice
+The last case works because **an attempt is counted as soon as a worker takes a
+notification**, not when the attempt fails. Even if a notification crashes the worker every
+time, each crash uses up an attempt, so it cannot loop forever.
 
-Networks are unreliable. A business might send "schedule this email", not get a reply
-in time, and send it again. Without protection, the customer would get two emails.
+Two situations do not use up an attempt, because the notification was never actually
+tried: waiting for the rate limit, and being returned to the queue when a worker shuts down.
 
-So every request carries an **idempotency key**. That is a technical name for a unique
-order number the business chooses, such as `welcome-ada-2026`.
+## 11. Duplicate requests
 
-- **First time** a key is seen: the notification is scheduled, and the reply is
-  **201 Created**.
-- **Same key and same details again**: nothing new is scheduled, and the reply is
-  **200 OK** with the original notification. This holds even if the two copies arrive at
-  exactly the same instant.
-- **Same key but different details**: the reply is **409 Conflict**. Reusing an order
-  number for a different order is almost certainly a mistake, so we say so rather than
-  guess.
+Networks are unreliable. A client may send a request, not receive the response in time,
+and send the same request again. Without protection, the recipient would get two emails.
 
-We tested twenty-five identical requests arriving at once: exactly one notification was
-created.
+Every request therefore includes an **idempotency key**: a unique value chosen by the
+client, similar to an order number.
 
-## 10. Not flooding one person: rate limiting
+- **First request with a key:** the notification is created, and the response is **201**.
+- **The same request again:** nothing new is created, and the response is **200** with the
+  original notification.
+- **The same key with different details:** the response is **409**, because reusing a key
+  for a different notification is almost certainly a client mistake.
 
-No one wants forty texts in an hour. Each recipient can receive at most a set number of
-notifications in any rolling hour: ten by default, and both numbers can be changed.
+A unique constraint in the database enforces this, so it holds even when two identical
+requests arrive at exactly the same moment. In a test, 25 identical requests sent at once
+created exactly one notification.
 
-- **"Rolling" matters.** A simple "per calendar hour" rule would allow ten at 12:59 and ten
-  more at 13:00: twenty in two minutes. We count the last sixty minutes from *right now*,
-  so that cannot happen.
-- **Extra messages wait; they are not failed.** A message over the limit goes back into
-  the queue, due at the exact moment a slot frees up, and waiting does not use up one of
-  its attempts.
-- **Workers take turns per recipient.** Two workers checking the same person at the same
-  instant could both see "one slot left" and both send. To prevent that, a worker takes a
-  brief turn on that recipient while it checks, like a single key to a room.
+## 12. Webhooks
 
-## 11. Telling other systems what happened: webhooks
-
-When a notification is **SENT**, **FAILED** or **DEAD_LETTERED**, Notify Queue sends a short
-status update to a web address the business provides. That is called a **webhook**. The
-update looks like:
+When a notification is SENT, FAILED or DEAD_LETTERED, Notify Queue calls the client's
+webhook URL with a short message:
 
 ```json
-{ "eventId": "0b7f6d2e-…", "jobId": "3f6c2b0e-…", "status": "SENT",
+{ "eventId": "0b7f6d2e-...", "jobId": "3f6c2b0e-...", "status": "SENT",
   "attemptCount": 2, "timestamp": "2026-09-24T12:01:03Z" }
 ```
 
-- **An update is never lost.** The update is written into the ledger in the same step as
-  the status change itself, so if a computer crashes in between, the update is still
-  there and is sent afterwards.
-- **If the business's system is down, we retry**, with growing waits, up to ten times.
-- **Updates can occasionally arrive twice**, for example if we sent one and crashed before
-  noting that. Each update carries a unique `eventId`, so the receiving system can ignore
-  one it has already seen. This is called "at least once" delivery, and it is the honest
-  promise for this kind of message.
-- **A broken webhook never affects the notification itself.** A notification that was sent
-  stays SENT even if its status update is struggling to get through.
+- **A webhook is never lost.** The webhook event is saved in the same transaction as the
+  status change. If a server crashes afterwards, the event is still in the database and is
+  sent later.
+- **Failed webhook calls are retried** with backoff, up to 10 times.
+- **A webhook can occasionally arrive twice**, for example if the server crashes after
+  sending it but before recording that it was sent. Each webhook has a unique `eventId`,
+  so the receiver can ignore repeats. This is called **at-least-once** delivery.
+- **A failing webhook never changes the notification.** A notification that was sent stays
+  SENT, even if its webhook cannot be delivered.
 
-## 12. Checking on things: status, lists and numbers
+## 13. Scaling, and what breaks first
 
-| To find out… | Ask… |
-| --- | --- |
-| What happened to one notification | `GET /notifications/{id}`: its status, attempts, last error and times |
-| Which notifications are in a given state, or for a given person | `GET /notifications?status=DEAD_LETTERED` or `?recipient=ada@example.com`, newest first, in pages |
-| How the whole system is doing | `GET /metrics`: how many are pending, sent, failed, dead-lettered and cancelled, plus how long the oldest waiting message has been waiting |
-| Whether the service is up | `GET /health` |
+**What already scales.** Workers keep no state of their own, so adding workers adds
+capacity. Because of `SKIP LOCKED`, workers do not wait for each other. Workers take
+notifications in batches, so one database query serves many notifications.
 
-The "oldest waiting message" number (queue lag) is the one to watch. If it keeps
-growing, the workers are not keeping up, and it is time to add more.
+As the system grows to millions of notifications and thousands of workers, the database is
+what comes under pressure. These are the limits, in the order they would be reached:
 
-## 13. Cancelling and re-trying by hand
-
-- **Cancel** (`DELETE /notifications/{id}`): a notification that has not started sending
-  can be cancelled, and then it is never sent. If a worker has already picked it up, the
-  answer is "too late" (409), and it goes out. The system guarantees it is one or the
-  other, never both: we tested 200 cancel-versus-send races happening at once. Cancelling
-  something already cancelled is harmless.
-- **Re-try** (`POST /notifications/{id}/retry`): sends a DEAD_LETTERED or FAILED
-  notification back into the queue with a fresh set of attempts, for example after an
-  outage. Each re-try is counted and timestamped on the notification, so there is a
-  record of who needed a second chance and when.
-
-## 14. When things break
-
-| What goes wrong | What happens |
-| --- | --- |
-| The same request arrives twice | One notification (section 9) |
-| A worker crashes before taking anything | Nothing lost; another worker takes the messages |
-| A worker crashes while holding messages | After five minutes they are handed to another worker |
-| A worker crashes just after the email went out | Sent again with the same reference; the delivery service recognises it; one email (section 4) |
-| A worker crashes on a message's last attempt | It gets one final re-check with the same reference, rather than being wrongly marked as failed |
-| The delivery service is down | Retries with growing waits, then set aside (sections 6 and 7) |
-| The delivery service hangs | Each attempt is cut off after ten seconds and counted as a failure |
-| The business's webhook address is down | Status updates retried; notifications unaffected |
-| Someone cancels just as a worker takes the message | Exactly one wins |
-| The database is unreachable | Requests get an error; `/health` reports the problem; workers keep trying until it is back |
-| A worker is shut down on purpose | It finishes what it is sending, hands back what it had not started, then stops |
-
-## 15. Growing to millions of notifications
-
-**What grows easily.** Workers hold nothing of their own, so adding more simply adds
-capacity. Because each worker skips messages another has taken, they do not slow each
-other down.
-
-**What would break first, and the fix, in order:**
-
-1. **Database connections.** Each worker keeps a few open connections to the database,
-   and databases handle a few hundred well but not thousands. The standard fix is a
-   connection pooler, which lets many workers share fewer connections.
-2. **Workers crowding the front of the queue.** With hundreds of workers all asking for
-   "the next due messages", they spend more time stepping around each other. The fix is to
-   split the queue into lanes (shards), with each worker mostly serving its own lane.
-3. **One very popular recipient.** If thousands of messages wait for one person, workers
-   keep picking them up, finding the limit reached, and putting them back. It is correct
-   but wasteful. The fix is to have workers skip recipients who are known to be at their
-   limit.
-4. **Sheer history.** Millions of old, finished notifications make the ledger large. The
-   fix is to archive or split old records by date. Waiting messages are already stored
-   separately in a way that stays fast however large the history grows.
-
-**When to move beyond one database.** One database handles thousands of notifications per
-second, which covers most businesses. Past that, a dedicated message system (Amazon SQS,
-RabbitMQ or Kafka) takes over the queue job. Each gives up something this design gets
-for free, notably recording "status changed" and "send an update" in one safe step. So
-the move is worth making only when the numbers demand it.
-
-## 16. Simplifying assumptions
-
-To keep the assessment focused, we made these assumptions. Each says why it is fair and
-what a real deployment would do.
-
-| We assumed… | Why that is fair here | In a real deployment |
+| Order | What breaks | The fix |
 | --- | --- | --- |
-| **Delivery services honour reference numbers**, so a repeated send is recognised | Most real email and SMS services support this, and the "one delivery" promise depends on it | Use each service's reference feature; where one has none, the honest promise is "at least once" |
-| **Sending is simulated.** A stand-in service fails at random at an adjustable rate, and always refuses addresses starting with "invalid" | The brief asks for a stand-in with random failures | Real email, SMS and push services behind the same connection point |
-| **One database does everything** | One thing to run and understand, and it scales a long way | The same, until volumes outgrow it (section 15) |
-| **Messages go out within about a second** of their scheduled time, not to the millisecond | Notifications do not need split-second timing | Check more often if tighter timing is needed |
-| **Priority is strict.** A constant stream of HIGH messages could keep LOW ones waiting indefinitely | The brief asks for high before low whenever both are due | Let long-waiting messages gradually move up |
-| **A recipient is exactly the text given.** `Ada@x.com` and `ada@x.com` count as different people for the rate limit | Each channel has its own rules for what counts as "the same" address | Tidy up addresses per channel before saving them |
-| **One rate limit for everyone**, across all channels | Matches the brief's "N per recipient per hour" | Separate limits per channel or per customer |
-| **Status updates go to one address, for final outcomes only, and are not signed** | These are the status changes the brief lists | A different address per customer, plus a signature proving each update came from us |
-| **Set-aside (dead-lettered) messages stay in the main ledger**, marked by their status | Easy to search, and their history stays in one place | The same, with re-tries limited to authorised staff |
-| **No logins or separate customers.** Anyone who can reach the service can use it | Outside the scope of the brief | Logins, per-customer data and per-customer limits |
-| **Message content is not checked** beyond basic shape and size (up to 64 KB) | We carry messages; the delivery service formats them | Check content per channel, such as text-message length limits |
-| **Messages can be scheduled up to a year ahead**; a time in the past means "send now" | Catches typos like the year 2099 while tolerating small clock differences | Adjustable per customer |
-| **The database's clock is the one clock** for every "is it due yet?" decision | Different computers' clocks drift; one clock removes the argument | The same |
+| 1 | **Database connections.** 1,000 workers with 10 connections each need 10,000 connections, but PostgreSQL handles a few hundred well. | A connection pooler such as PgBouncer, so many workers share a small number of connections. |
+| 2 | **Workers competing for the front of the queue.** With hundreds of workers polling, they spend time skipping rows that other workers have locked. | Split the queue into shards, with each worker mainly polling its own shard. |
+| 3 | **Recipients with a large backlog.** Workers repeatedly pick up and defer notifications that are over the rate limit. | Make workers skip recipients who are known to be at their limit. |
+| 4 | **Table size.** Millions of finished notifications make the table large. | Partition the table by date and archive old data. |
 
-## 17. Choices we made, and what they cost
+One PostgreSQL server can handle thousands of notifications per second, which is enough
+for most businesses. Beyond that, a dedicated broker such as Amazon SQS or Kafka would take
+over the queue, and PostgreSQL would remain the record of each notification's status. That
+move has a cost: a broker cannot save a status change and its webhook event in one
+transaction, so that guarantee would have to be rebuilt.
 
-| We chose… | Instead of… | Because… | The cost |
+## 14. Simplifying assumptions
+
+| Assumption | Why it is reasonable here | What production would need |
+| --- | --- | --- |
+| The email/SMS/push provider is **simulated**, with a configurable random failure rate. | The brief asks for a mock sender with random failures. | Real providers behind the same interface. |
+| The provider **supports idempotency keys**. Exactly-once delivery depends on this. | Most real email and SMS providers do. | Use each provider's idempotency feature. Where there is none, the guarantee becomes at-least-once. |
+| **PostgreSQL is the only infrastructure.** | It keeps the system simple and consistent, and it scales a long way. | The same, until one server is not enough (section 13). |
+| Notifications are sent **within about one second** of their scheduled time. | Notifications do not need millisecond precision. | Poll more often if tighter timing is needed. |
+| **Priority is strict.** A constant stream of HIGH notifications could delay LOW ones for a long time. | The brief asks for high priority before low. | Raise a notification's priority the longer it waits (aging). |
+| The rate limit is the **same for every recipient and channel**. | The brief asks for N notifications per recipient per hour. | Separate limits per channel or per customer. |
+| A recipient is identified by the **exact text given**, so `Ada@example.com` and `ada@example.com` count separately. | Each channel has its own rules for matching addresses. | Normalise addresses before saving them. |
+| Webhooks go to **one URL**, only for final outcomes, and are **not signed**. | These are the status changes the brief lists. | A URL per client, and signed webhooks. |
+| There is **no authentication**. | It is outside the scope of the brief. | Authentication, with operator-only access to cancel and retry. |
+
+## 15. Trade-offs
+
+| I chose | Instead of | Benefit | Cost |
 | --- | --- | --- | --- |
-| A database as the queue | A separate message system | One thing to run; status, duplicates, limits and updates all stay consistent together | Eventually needs sharding or a message system at very large scale |
-| Counting an attempt when a message is picked up | Counting only when it fails | A message that crashes every worker still runs out of attempts | Attempts that never started (rate limit, shutdown) have to be handed back |
-| A rolling-hour rate limit | Per-calendar-hour counting | No burst of double the limit around the hour mark | Keeps a small record per sent message, cleaned up regularly |
-| Writing status updates into the ledger first | Sending them straight away | A crash can never lose one | Updates can occasionally arrive twice (each has an ID to spot repeats) |
-| Rejecting a reused order number with different details | Quietly returning the old notification | A reused number is almost always a bug worth surfacing | The business must pick new numbers for new notifications |
-| One extra re-check when a last attempt's worker crashes | Marking it failed at once | The email may actually have gone out; one re-check with the same reference settles it | At most one extra attempt per notification |
+| PostgreSQL as the queue | A message broker | One system; status, duplicates, rate limits and webhooks stay consistent | Very large scale eventually needs sharding or a broker |
+| Counting an attempt when a notification is picked up | Counting it when it fails | A notification that crashes workers still runs out of attempts | Waiting jobs (rate limit, shutdown) must have their attempt given back |
+| A rolling-hour rate limit | A limit that resets every hour | No double burst around the hour | A small record is kept for each delivery |
+| Saving webhooks in the same transaction as the status | Calling the webhook immediately | A crash can never lose a webhook | A webhook can occasionally arrive twice |
+| Returning 409 when a key is reused with different details | Silently returning the old notification | Client mistakes are visible | Clients must use a new key for each new notification |
+| One final re-check when a worker crashes on the last attempt | Marking the notification as failed straight away | The email may already have been delivered; re-sending with the same key confirms it | At most one extra attempt per notification |
 
-## 18. A few words, explained
+## 16. Glossary
 
-| Word | Meaning |
+| Term | Meaning |
 | --- | --- |
-| **API** | The front door other systems use to talk to Notify Queue |
-| **Job** | One notification waiting to be sent, with its schedule and history |
-| **Worker** | A program that picks up due notifications and sends them; many can run at once |
-| **Queue** | The list of notifications waiting their turn |
-| **Claim** | A worker taking a notification so no other worker can |
-| **Lease / visibility timeout** | How long a claim lasts before the system assumes the worker is gone (five minutes) |
-| **Idempotency key** | A unique order number from the business, so a repeated request does not create a second notification |
-| **Retry / backoff** | Trying again later, waiting a little longer each time |
-| **Dead-letter queue** | The shelf of notifications that could not be delivered after every attempt |
-| **Poison message** | A notification that can never succeed and must not loop forever |
-| **Rate limit** | The cap on how many notifications one person can receive per hour |
-| **Webhook** | A status update Notify Queue sends to the business's own system |
-| **At least once** | A promise that something will arrive, possibly twice, never zero times |
-| **Metrics** | Headline numbers about how the system is doing |
+| **API** | The part of the system that other systems send requests to |
+| **Worker** | A process that picks up due notifications and delivers them |
+| **Queue** | The notifications waiting to be sent |
+| **Claim** | A worker taking a notification so that no other worker can take it |
+| **`SKIP LOCKED`** | A PostgreSQL feature that lets each worker skip notifications another worker has locked |
+| **Idempotency key** | A unique value that makes a repeated request or delivery have no extra effect |
+| **Exponential backoff** | Waiting about twice as long before each retry |
+| **Jitter** | A small random amount added to each wait, so retries do not all happen together |
+| **Dead-letter queue** | Where notifications go after every attempt has failed |
+| **Poison message** | A notification that can never succeed |
+| **Rate limit** | The maximum number of notifications one recipient can receive in an hour |
+| **Webhook** | A call Notify Queue makes to the client's system to report a status change |
+| **At-least-once** | Something is delivered one or more times, never zero times |

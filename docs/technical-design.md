@@ -1,7 +1,8 @@
 # Notify Queue: Technical Design
 
-This is the engineering companion to [DESIGN.md](../DESIGN.md), which explains the same system in plain language. It covers how Notify Queue works in technical detail and why it is built the way it is. The
-[README](../README.md) covers running it.
+This is the engineering companion to [DESIGN.md](../DESIGN.md), which explains the same
+system in plain English. This document covers how Notify Queue works in technical detail
+and why it is built this way. The [README](../README.md) explains how to run it.
 
 ## Contents
 
@@ -136,11 +137,12 @@ Controller → DTO → Service → Repository → PostgreSQL
 | `recipient`, `channel`, `payload` | `payload` is `jsonb` and is never logged or returned by the API |
 | `reconciliation_granted` | Set once, when recovery grants an extra attempt to a job whose final attempt's claim expired (section 15) |
 | `priority` | `smallint` (HIGH=3, NORMAL=2, LOW=1), so `ORDER BY priority DESC` means urgency |
-| `status` | PENDING, PROCESSING, SENT, FAILED, DEAD_LETTERED |
+| `status` | PENDING, PROCESSING, SENT, FAILED, DEAD_LETTERED, CANCELLED |
 | `scheduled_at`, `next_attempt_at` | First due time; next due time (moves on retry or rate-limit deferral) |
 | `attempt_count`, `max_attempts` | Attempts started; the cap (`MAX_RETRIES + 1`) |
 | `locked_by`, `locked_at`, `claim_token` | The current claim: owner, lease start, fencing token |
-| `last_error`, `sent_at`, `failed_at`, `dead_lettered_at` | Outcome detail |
+| `last_error`, `sent_at`, `failed_at`, `dead_lettered_at`, `cancelled_at` | Outcome details |
+| `redrive_count`, `last_redriven_at` | How many times an operator has retried the job, and when (the audit trail for redrives) |
 | `created_at`, `updated_at` | `timestamptz` throughout |
 
 **Constraints.** The application relies on these, so the database enforces them:
@@ -164,12 +166,12 @@ Controller → DTO → Service → Repository → PostgreSQL
 | `(status, created_at DESC, id DESC)` | Listing by status, e.g. the dead-letter queue (`?status=DEAD_LETTERED`); the page cursor becomes part of the index condition |
 | `(created_at DESC, id DESC)` | Listing everything, newest first |
 
-The spec suggested `(status, next_attempt_at, priority)` and `(status, locked_at)`.
-Partial indexes do the same job with a fraction of the size: in a mature system almost
-every row is SENT, and those rows are simply not in the index. The claim index's column
-order also matches the `ORDER BY` exactly, which a status-leading composite cannot while
-the filter is a range on `next_attempt_at`. `EXPLAIN` confirms an index scan with no sort
-node.
+A common alternative is composite indexes that start with `status`, such as
+`(status, next_attempt_at, priority)` and `(status, locked_at)`. Partial indexes do the
+same job at a fraction of the size: in a mature system almost every row is SENT, and those
+rows are not in the index at all. The claim index's column order also matches the
+`ORDER BY` exactly, which a status-first composite cannot do when the filter is a range on
+`next_attempt_at`. `EXPLAIN` confirms an index scan with no sort step.
 
 ### Supporting tables
 
@@ -203,10 +205,10 @@ Two implementation notes:
 - The hot paths (claiming, recovery, idempotent insert) are written as explicit SQL,
   because that SQL *is* the design and should be read directly. Simple lookups use
   TypeORM.
-- TypeORM's `query()` returns rows for SELECT and INSERT but `[rows, count]` for UPDATE and
-  DELETE. Every data-changing query that reads rows back goes through one helper
-  (`runQuery`) that always returns `{ records, affected }`. This was found the hard way
-  and is now impossible to get wrong by accident.
+- TypeORM's `query()` returns rows for SELECT and INSERT, but `[rows, count]` for UPDATE
+  and DELETE. Every data-changing query that reads rows back therefore goes through one
+  helper (`runQuery`), which always returns `{ records, affected }`, so no caller has to
+  remember the difference.
 
 ## 6. Job lifecycle
 
@@ -449,7 +451,7 @@ deduplicable by event ID.
 
 ## 11. Retry and backoff
 
-`RetryPolicyService` is pure (no I/O), so it is unit-tested exhaustively.
+`RetryPolicyService` is pure (it performs no I/O), so it is fully covered by unit tests.
 
 ```
 delay(attempt) = jitter( min(BASE_RETRY_DELAY_MS × 2^(attempt − 1), MAX_RETRY_DELAY_MS) )
@@ -530,8 +532,8 @@ taking the worker down.
 
 FAILED is kept distinct from DEAD_LETTERED on purpose. FAILED means the provider said no
 (retrying cannot help); DEAD_LETTERED means the provider kept failing (retrying later
-might). An operator treats them differently; both can be redriven, but a FAILED job should only
-be redriven once whatever the provider rejected has been fixed.
+might). An operator treats them differently: both can be redriven, but a FAILED job
+should be redriven only after the cause of the rejection has been fixed.
 
 ## 13. Rate limiting
 
@@ -541,10 +543,10 @@ be redriven once whatever the provider rejected has been fixed.
 worker's memory knows nothing about what the others sent, so limits have to live in
 shared state.
 
-**Why a sliding window, not a fixed-window counter.** The spec suggested a table with
-`window_start`, `window_end` and a count. That is a fixed window, and fixed windows allow
-2N at a boundary: N at 12:59:59 and N more at 13:00:00. The requirement says rolling, so
-the implementation keeps a small log instead:
+**Why a sliding window, not a fixed-window counter.** A common approach is a counter row
+with `window_start`, `window_end` and a count. That is a fixed window, and a fixed window
+allows 2N at a boundary: N at 12:59:59 and N more at 13:00:00. The requirement is a rolling
+limit, so the implementation keeps a small log instead:
 
 - **`rate_limit_reservations`** holds one row per job admitted for delivery.
 - **Admission** is allowed while fewer than N rows for the recipient fall inside the last
@@ -614,8 +616,8 @@ changed. No crash can separate them.
 **Dispatch.** Every worker runs a dispatcher on `WEBHOOK_POLL_INTERVAL_MS`:
 
 1. **Claim due events** in one statement: `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP
-   LOCKED LIMIT 50)`. This pushes `next_attempt_at` forward by a lease, so a dispatcher that
-   dies mid-POST releases its events simply by letting the lease expire.
+   LOCKED LIMIT 50)`. This pushes `next_attempt_at` forward by a lease, so if a dispatcher
+   dies mid-POST, its events become due again when the lease expires.
 2. **POST each event** with a timeout. No transaction is open during the request.
 3. **Record the result:** delivered; or retry with the same backoff policy as jobs; or give
    up after `WEBHOOK_MAX_ATTEMPTS`. The POST and the bookkeeping are handled separately:
@@ -648,12 +650,11 @@ it must stay comfortably above the longest legitimate delivery, or live jobs get
 and delivered twice (safe with an idempotent provider, wasteful anyway). The default of
 five minutes against a ten-second provider timeout leaves a wide margin.
 
-**Graceful shutdown in containers.** Compose runs each process under an init so SIGTERM
-reaches Node, and gives workers a stop grace period longer than the drain timeout. Nest's
-shutdown hooks exit through `process.exit(0)` after draining rather than re-raising the
-signal. pino writes asynchronously and flushes on exit, and a re-raised SIGTERM skipped
-that, which silently dropped the final log lines under load (found during the Docker
-smoke test).
+**Graceful shutdown in containers.** Docker Compose runs each process under an init
+process, so SIGTERM reaches Node, and it gives workers a stop grace period longer than the
+drain timeout. After draining, Nest's shutdown hooks exit with `process.exit(0)` instead of
+re-raising the signal. This matters because pino writes logs asynchronously and flushes
+them on exit; re-raising SIGTERM skips that flush and loses the last log lines.
 
 ## 16. Failure matrix
 
@@ -695,8 +696,9 @@ smoke test).
   `responseTime`. Client errors log at warn and server errors at error. Health probes are
   not logged.
 - **Every worker event:** `workerId`, `jobId`, `attempt`, `event` and `durationMs`. Events
-  are `job.sent`, `job.retry`, `job.dead_letter`, `job.fail`, `job.rate_limited`,
-  `job.claim_lost`, `jobs.recovered`, `worker.drained` and `webhook.failed`.
+  include `job.sent`, `job.retry`, `job.dead_letter`, `job.fail`, `job.rate_limited`,
+  `job.released`, `job.claim_lost`, `jobs.recovered`, `worker.drained` and
+  `webhook.failed`. Operator actions log `job.cancelled` and `job.redriven`.
 
 **Request IDs.** A caller's `X-Request-ID` is accepted if it is short and log-safe;
 otherwise one is generated. It is echoed on every response, included in every error body,
@@ -825,7 +827,7 @@ In the order they would bite:
 | Lease with a fencing token | Lock held across delivery | Never hold locks across network calls; the token makes a late worker harmless |
 | Attempts counted at claim | Counted on failure | Poison messages exhaust their attempts instead of cycling forever. Costs a refund on deferral and release |
 | FAILED separate from DEAD_LETTERED | One failure state | Different causes, different operator responses |
-| Sliding-window rate limit | Fixed-window counter (spec's suggestion) | The requirement says rolling; fixed windows allow 2N at a boundary. Costs one row per admission, pruned periodically |
+| Sliding-window rate limit | Fixed-window counter | The requirement is a rolling limit; a fixed window allows 2N at a boundary. Costs one row per admission, pruned periodically |
 | Advisory lock per recipient | Row lock | A new recipient has no row to lock |
 | Transactional outbox | POST after commit | A crash cannot lose a webhook. Costs one insert per terminal transition and a dispatcher |
 | `ON CONFLICT DO NOTHING` + read back | Check then insert, catch the unique violation | No race window and no error-driven control flow |
