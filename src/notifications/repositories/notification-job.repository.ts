@@ -11,13 +11,17 @@ import type { NotificationChannel } from '../../common/enums/notification-channe
 import { sourceStatusesFor } from '../domain/job-state-machine.js';
 import { NotificationJob } from '../entities/notification-job.entity.js';
 
+/** When a job first becomes due: an absolute time, or a delay from the database's now(). */
+export type JobSchedule = { sendAt: Date } | { delaySeconds: number };
+
 export interface NewNotificationJob {
   idempotencyKey: string;
+  requestFingerprint: string;
   recipient: string;
   channel: NotificationChannel;
   payload: Record<string, unknown>;
   priority: JobPriority;
-  scheduledAt: Date;
+  schedule: JobSchedule;
   maxAttempts: number;
 }
 
@@ -67,22 +71,32 @@ export class NotificationJobRepository {
    * `ON CONFLICT DO NOTHING` makes the unique constraint the arbiter: when two
    * requests race, the loser's INSERT waits for the winner to commit and then
    * inserts nothing, so it never surfaces as a unique-violation error.
+   *
+   * A relative delay is resolved against the database clock, the same clock
+   * the claim query compares `next_attempt_at` with.
    */
   async insertIfAbsent(input: NewNotificationJob): Promise<InsertOutcome> {
+    const sendAt = 'sendAt' in input.schedule ? input.schedule.sendAt : null;
+    const delaySeconds = 'delaySeconds' in input.schedule ? input.schedule.delaySeconds : null;
+
     const { records } = await this.run<{ id: string }>(
       `INSERT INTO notification_jobs
-         (idempotency_key, recipient, channel, payload, priority,
+         (idempotency_key, request_fingerprint, recipient, channel, payload, priority,
           scheduled_at, next_attempt_at, max_attempts)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6, $7)
+       SELECT $1, $2, $3, $4, $5::jsonb, $6, due.at, due.at, $9
+         FROM (SELECT COALESCE($7::timestamptz,
+                               now() + make_interval(secs => $8::double precision)) AS at) AS due
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING id`,
       [
         input.idempotencyKey,
+        input.requestFingerprint,
         input.recipient,
         input.channel,
         JSON.stringify(input.payload),
         JOB_PRIORITY_RANK[input.priority],
-        input.scheduledAt,
+        sendAt,
+        delaySeconds,
         input.maxAttempts,
       ],
     );

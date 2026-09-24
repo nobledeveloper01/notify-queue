@@ -20,7 +20,8 @@ export interface WorkerConfig {
 }
 
 export interface RetryConfig {
-  maxAttempts: number;
+  /** Retries after the first attempt; a job gets `maxRetries + 1` attempts in total. */
+  maxRetries: number;
   baseDelayMs: number;
   maxDelayMs: number;
 }
@@ -66,7 +67,7 @@ export const buildConfig = (env: EnvironmentVariables): AppConfig => ({
     visibilityTimeoutSeconds: env.JOB_VISIBILITY_TIMEOUT_SECONDS,
   },
   retry: {
-    maxAttempts: env.MAX_RETRIES,
+    maxRetries: env.MAX_RETRIES,
     baseDelayMs: env.BASE_RETRY_DELAY_MS,
     maxDelayMs: env.MAX_RETRY_DELAY_MS,
   },

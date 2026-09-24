@@ -71,7 +71,8 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
 
   describe('insertIfAbsent', () => {
     it('creates a pending job due at its scheduled time', async () => {
-      const input = newJob({ priority: JobPriority.High });
+      const sendAt = new Date(Date.now() - 1000);
+      const input = newJob({ priority: JobPriority.High, schedule: { sendAt } });
 
       const { job, created } = await repository.insertIfAbsent(input);
 
@@ -79,8 +80,21 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
       expect(job.status).toBe(JobStatus.Pending);
       expect(job.priority).toBe(JobPriority.High);
       expect(job.attemptCount).toBe(0);
-      expect(job.nextAttemptAt.getTime()).toBe(input.scheduledAt.getTime());
+      expect(job.scheduledAt).toEqual(sendAt);
+      expect(job.nextAttemptAt).toEqual(sendAt);
       expect(job.payload).toEqual(input.payload);
+      expect(job.requestFingerprint).toBe(input.requestFingerprint);
+    });
+
+    it('resolves a relative delay against the database clock', async () => {
+      const [{ now }]: { now: Date }[] = await dataSource.query('SELECT now() AS now');
+
+      const { job } = await repository.insertIfAbsent(newJob({ schedule: { delaySeconds: 90 } }));
+
+      const offsetMs = job.scheduledAt.getTime() - new Date(now).getTime();
+      expect(offsetMs).toBeGreaterThanOrEqual(90_000);
+      expect(offsetMs).toBeLessThan(95_000);
+      expect(job.nextAttemptAt).toEqual(job.scheduledAt);
     });
 
     it('returns the existing job for a repeated idempotency key', async () => {
@@ -100,14 +114,14 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
       const now = Date.now();
       const low = await repository.insertIfAbsent(newJob({ priority: JobPriority.Low }));
       const normalLater = await repository.insertIfAbsent(
-        newJob({ scheduledAt: new Date(now - 1_000) }),
+        newJob({ schedule: { sendAt: new Date(now - 1_000) } }),
       );
       const normalEarlier = await repository.insertIfAbsent(
-        newJob({ scheduledAt: new Date(now - 60_000) }),
+        newJob({ schedule: { sendAt: new Date(now - 60_000) } }),
       );
       const high = await repository.insertIfAbsent(newJob({ priority: JobPriority.High }));
       await repository.insertIfAbsent(
-        newJob({ priority: JobPriority.High, scheduledAt: new Date(now + 60_000) }),
+        newJob({ priority: JobPriority.High, schedule: { sendAt: new Date(now + 60_000) } }),
       );
 
       const { jobs } = await repository.claimDueJobs('worker-a', 10);

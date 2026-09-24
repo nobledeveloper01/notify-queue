@@ -33,6 +33,13 @@ export class NotificationJob {
   @Column({ name: 'idempotency_key', type: 'varchar', length: 255 })
   idempotencyKey: string;
 
+  /**
+   * SHA-256 of the canonical creating request (see `fingerprintRequest`).
+   * NULL only for jobs created before fingerprints were recorded.
+   */
+  @Column({ name: 'request_fingerprint', type: 'char', length: 64, nullable: true })
+  requestFingerprint: string | null;
+
   @Column({ type: 'varchar', length: 320 })
   recipient: string;
 

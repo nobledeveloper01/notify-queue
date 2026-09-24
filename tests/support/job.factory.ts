@@ -6,11 +6,12 @@ import type { NewNotificationJob } from '../../src/notifications/repositories/no
 /** A due, valid job; override only what the test is about. */
 export const newJob = (overrides: Partial<NewNotificationJob> = {}): NewNotificationJob => ({
   idempotencyKey: `test-${randomUUID()}`,
+  requestFingerprint: randomUUID().replaceAll('-', '').padEnd(64, '0'),
   recipient: 'user@example.com',
   channel: NotificationChannel.Email,
   payload: { subject: 'Hello', body: 'World' },
   priority: JobPriority.Normal,
-  scheduledAt: new Date(Date.now() - 1000),
+  schedule: { sendAt: new Date(Date.now() - 1000) },
   maxAttempts: 3,
   ...overrides,
 });
