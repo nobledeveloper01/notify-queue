@@ -1,0 +1,25 @@
+name: notify-queue
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: notify_queue
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      # 5434 on the host avoids clashing with a local Postgres on 5432.
+      - '${POSTGRES_HOST_PORT:-5434}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Container start is not database readiness; dependants wait on this.
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d notify_queue']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  postgres-data:
