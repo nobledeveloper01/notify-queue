@@ -9,4 +9,6 @@ export enum JobStatus {
   Failed = 'FAILED',
   /** Terminal: every allowed attempt failed with a retryable error. */
   DeadLettered = 'DEAD_LETTERED',
+  /** Terminal: cancelled by a client while still PENDING; never delivered. */
+  Cancelled = 'CANCELLED',
 }

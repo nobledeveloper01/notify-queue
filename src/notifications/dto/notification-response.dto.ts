@@ -51,6 +51,18 @@ export class NotificationResponseDto {
   @ApiProperty({ type: String, format: 'date-time', nullable: true, example: null })
   deadLetteredAt: string | null;
 
+  @ApiProperty({ type: String, format: 'date-time', nullable: true, example: null })
+  cancelledAt: string | null;
+
+  @ApiProperty({
+    example: 0,
+    description: 'Times this job was sent back to the queue with POST /notifications/:id/retry.',
+  })
+  redriveCount: number;
+
+  @ApiProperty({ type: String, format: 'date-time', nullable: true, example: null })
+  lastRedrivenAt: string | null;
+
   @ApiProperty({ format: 'date-time' })
   createdAt: string;
 
@@ -74,6 +86,9 @@ export class NotificationResponseDto {
       sentAt: iso(job.sentAt),
       failedAt: iso(job.failedAt),
       deadLetteredAt: iso(job.deadLetteredAt),
+      cancelledAt: iso(job.cancelledAt),
+      redriveCount: job.redriveCount,
+      lastRedrivenAt: iso(job.lastRedrivenAt),
       createdAt: job.createdAt.toISOString(),
       updatedAt: job.updatedAt.toISOString(),
     };

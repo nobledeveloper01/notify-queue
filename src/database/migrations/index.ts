@@ -4,6 +4,7 @@ import { CreateMockProviderDeliveries1790380800000 } from './1790380800000-creat
 import { CreateRateLimitReservations1790467200000 } from './1790467200000-create-rate-limit-reservations.js';
 import { CreateWebhookOutbox1790553600000 } from './1790553600000-create-webhook-outbox.js';
 import { AddReconciliationGrant1790640000000 } from './1790640000000-add-reconciliation-grant.js';
+import { AddCancelRedriveAndListing1790726400000 } from './1790726400000-add-cancel-redrive-and-listing.js';
 
 /**
  * Registered explicitly rather than by file glob: the same list works from
@@ -17,4 +18,5 @@ export const migrations = [
   CreateRateLimitReservations1790467200000,
   CreateWebhookOutbox1790553600000,
   AddReconciliationGrant1790640000000,
+  AddCancelRedriveAndListing1790726400000,
 ];

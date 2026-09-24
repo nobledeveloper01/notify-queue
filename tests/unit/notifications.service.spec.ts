@@ -1,5 +1,5 @@
 import { jest } from '@jest/globals';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import { JobPriority } from '../../src/common/enums/job-priority.enum.js';
 import { JobStatus } from '../../src/common/enums/job-status.enum.js';
@@ -40,6 +40,9 @@ const jobFrom = (input: NewNotificationJob): NotificationJob => {
     attemptCount: 0,
     maxAttempts: input.maxAttempts,
     reconciliationGranted: false,
+    cancelledAt: null,
+    redriveCount: 0,
+    lastRedrivenAt: null,
     lockedAt: null,
     lockedBy: null,
     claimToken: null,
@@ -67,7 +70,32 @@ describe('NotificationsService', () => {
       return Promise.resolve({ job: stored, created: true });
     });
     findById = jest.fn((_id: string) => Promise.resolve(stored));
-    const repository = { insertIfAbsent, findById } as unknown as NotificationJobRepository;
+    // Mirror the repository's conditional updates on the in-memory job.
+    const cancelPending = jest.fn(() => {
+      if (stored?.status !== JobStatus.Pending) return Promise.resolve(false);
+      stored.status = JobStatus.Cancelled;
+      stored.cancelledAt = new Date();
+      return Promise.resolve(true);
+    });
+    const redrive = jest.fn((_id: string, maxAttempts: number) => {
+      if (stored?.status !== JobStatus.DeadLettered && stored?.status !== JobStatus.Failed) {
+        return Promise.resolve(false);
+      }
+      Object.assign(stored, {
+        status: JobStatus.Pending,
+        attemptCount: 0,
+        maxAttempts,
+        redriveCount: stored.redriveCount + 1,
+        lastRedrivenAt: new Date(),
+      });
+      return Promise.resolve(true);
+    });
+    const repository = {
+      insertIfAbsent,
+      findById,
+      cancelPending,
+      redrive,
+    } as unknown as NotificationJobRepository;
     const config = {
       get: (key: keyof AppConfig) =>
         key === 'retry' ? { maxRetries: 5, baseDelayMs: 1000, maxDelayMs: 60000 } : undefined,
@@ -161,5 +189,56 @@ describe('NotificationsService', () => {
         NotFoundException,
       );
     });
+  });
+
+  describe('cancel', () => {
+    it('cancels a pending job, and repeating it returns the same job', async () => {
+      const { notification } = await service.schedule(dto());
+
+      const first = await service.cancel(notification.id);
+      const again = await service.cancel(notification.id);
+
+      expect(first.status).toBe(JobStatus.Cancelled);
+      expect(again).toEqual(first);
+    });
+
+    it('refuses a job that is no longer pending', async () => {
+      const { notification } = await service.schedule(dto());
+      if (stored) stored.status = JobStatus.Processing;
+
+      await expect(service.cancel(notification.id)).rejects.toThrow(ConflictException);
+    });
+
+    it('returns 404 for an unknown job', async () => {
+      await expect(service.cancel('3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+
+  describe('redrive', () => {
+    it('gives a dead-lettered job a fresh budget of maxRetries + 1 attempts', async () => {
+      const { notification } = await service.schedule(dto());
+      if (stored) Object.assign(stored, { status: JobStatus.DeadLettered, attemptCount: 6 });
+
+      const redriven = await service.redrive(notification.id);
+
+      expect(redriven).toMatchObject({
+        status: JobStatus.Pending,
+        attemptCount: 0,
+        maxAttempts: 6,
+        redriveCount: 1,
+      });
+    });
+
+    it.each([JobStatus.Pending, JobStatus.Processing, JobStatus.Sent, JobStatus.Cancelled])(
+      'refuses a %s job',
+      async (status) => {
+        const { notification } = await service.schedule(dto());
+        if (stored) stored.status = status;
+
+        await expect(service.redrive(notification.id)).rejects.toThrow(ConflictException);
+      },
+    );
   });
 });

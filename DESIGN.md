@@ -105,8 +105,8 @@ Controller → DTO → Service → Repository → PostgreSQL
 
 | Component | Responsibility |
 | --- | --- |
-| `NotificationsController` | `POST /notifications`, `GET /notifications/:id`; 201 vs 200 on replay |
-| `NotificationsService` | Resolve the schedule, fingerprint the request, detect key reuse (409) |
+| `NotificationsController` | Schedule, get, list, cancel and redrive; 201 vs 200 on replay |
+| `NotificationsService` | Resolve the schedule, fingerprint the request, detect key reuse (409); cancel and redrive rules (404, 409, idempotent cancel, audited redrive); cursor decoding |
 | `NotificationJobRepository` | Every read and write of `notification_jobs`, including claiming, fenced completion, recovery and the outbox insert |
 | `job-state-machine.ts` | The legal status transitions; repositories derive their `WHERE status IN (…)` guards from it |
 | `WorkerScheduler` | Drives the poll loop, the recovery timer and the webhook timer; starts only when the role is not `api`; drains on shutdown |
@@ -151,7 +151,8 @@ Controller → DTO → Service → Repository → PostgreSQL
 - `CHECK ((status = 'PROCESSING') = (claim_token, locked_by, locked_at all NOT NULL))`:
   a job holds a claim exactly when it is PROCESSING. An orphaned PROCESSING row, or a
   PENDING row that still names an owner, cannot exist.
-- `CHECK` that SENT, FAILED and DEAD_LETTERED each carry their timestamp.
+- `CHECK` that SENT, FAILED, DEAD_LETTERED and CANCELLED each carry their timestamp.
+- `CHECK` that `redrive_count` and `last_redriven_at` agree (both zero/NULL, or both set).
 
 **Indexes.** Partial indexes cover only the rows each hot query reads:
 
@@ -159,7 +160,9 @@ Controller → DTO → Service → Repository → PostgreSQL
 | --- | --- |
 | `(priority DESC, next_attempt_at, created_at) WHERE status = 'PENDING'` | The claim query, in its exact `ORDER BY`, so PostgreSQL walks the index and stops after `LIMIT` rows, with no sort |
 | `(locked_at) WHERE status = 'PROCESSING'` | Stale-claim recovery |
-| `(recipient, created_at)` | Required by the spec, for per-recipient support queries. No current code path uses it (rate limiting reads its own reservations table), so it costs a little on every insert until a "jobs for this recipient" view exists |
+| `(recipient, created_at)` | Listing a recipient's jobs (`GET /notifications?recipient=…`) |
+| `(status, created_at DESC, id DESC)` | Listing by status, e.g. the dead-letter queue (`?status=DEAD_LETTERED`); the page cursor becomes part of the index condition |
+| `(created_at DESC, id DESC)` | Listing everything, newest first |
 
 The spec suggested `(status, next_attempt_at, priority)` and `(status, locked_at)`.
 Partial indexes do the same job with a fraction of the size: in a mature system almost
@@ -173,13 +176,13 @@ node.
 | Table | Purpose |
 | --- | --- |
 | `rate_limit_reservations` | One row per job admitted for delivery: `(job_id PK, recipient, reserved_at)`, indexed `(recipient, reserved_at)` |
-| `webhook_events` | The outbox: one row per terminal status change, with dispatch attempts, next attempt, delivered/given-up timestamps; `UNIQUE (job_id, status)` |
+| `webhook_events` | The outbox: one row per terminal status change, with dispatch attempts, next attempt, delivered/given-up timestamps; `UNIQUE (job_id, status, redrive_count)`, so a redriven job's second terminal event does not collide with its first |
 | `mock_provider_deliveries` | The mock provider's own record of accepted delivery keys; stands in for a real provider's store and would not exist in production |
 | `mock_webhook_receipts` | The demo receiver's record of event IDs, with a count of redeliveries |
 
-Six migrations build this schema, each adding one feature. None was ever edited after
-being applied: when a column was needed later (`request_fingerprint`,
-`reconciliation_granted`), it came as a new migration.
+Seven migrations build this schema, each adding one feature. None was ever edited after
+being applied: when something was needed later (`request_fingerprint`,
+`reconciliation_granted`, cancellation and redrive), it came as a new migration.
 
 ## 5. Repository architecture
 
@@ -217,14 +220,44 @@ Two implementation notes:
         rate limited (attempt refunded)
         released at shutdown (attempt refunded)
         claim expired (recovery)
+
+   Operator actions (API calls, never automatic):
+   PENDING ──────── DELETE /notifications/:id ─────────▶ CANCELLED
+   DEAD_LETTERED ┐
+   FAILED ───────┴─ POST /notifications/:id/retry ─────▶ PENDING  (fresh attempt budget)
 ```
 
-- Terminal states (SENT, FAILED, DEAD_LETTERED) have no outgoing transitions. Nothing
-  moves a SENT job back to PROCESSING, and there is no automatic retry out of
-  DEAD_LETTERED.
-- The transition table lives in `job-state-machine.ts`. Repositories derive each
+- Terminal states (SENT, FAILED, DEAD_LETTERED, CANCELLED) have no *automatic* outgoing
+  transitions. Nothing the system does on its own moves a SENT job back to PROCESSING or
+  retries a DEAD_LETTERED job.
+- The automatic transitions live in `job-state-machine.ts`. Repositories derive each
   update's `WHERE status IN (…)` from it rather than repeating the rules, so the database
   refuses an illegal transition even if the calling code is wrong.
+- Operator actions live in a separate table in the same file (`OPERATOR_TRANSITIONS`).
+  Widening the automatic table instead would widen the guard on every worker update.
+
+### Cancelling
+
+`DELETE /notifications/:id` is one conditional update:
+`… SET status = 'CANCELLED' WHERE id = $1 AND status = 'PENDING'`. It races safely with
+claiming. If a worker's claim transaction holds the row, the cancel waits for it,
+re-checks the condition, finds PROCESSING, and changes nothing. The client gets a 409, and
+the job is delivered. Each job therefore ends up either cancelled and never claimed, or
+claimed and not cancelled. `tests/concurrency/cancel-vs-claim.spec.ts` runs 200 such races
+at once and checks every job. Cancelling an already cancelled job returns it unchanged,
+so the call is safe to retry. Cancellation is a client action and emits no webhook.
+
+### Listing
+
+`GET /notifications?status=&recipient=&limit=&cursor=` returns jobs newest first, using
+keyset pagination on `(created_at, id)`:
+
+- **Every page is an index range scan** starting where the last one ended, so page 1,000
+  costs the same as page 1. With `OFFSET`, the database would read and discard every
+  earlier row.
+- **The cursor is opaque** (base64url) and carries PostgreSQL's exact `created_at` text.
+  A JavaScript `Date` would drop microseconds, and jobs created in the same millisecond
+  would be skipped or repeated. A test pages through 23 jobs that share one timestamp.
 
 ## 7. Distributed job claiming
 
@@ -464,7 +497,19 @@ A job becomes DEAD_LETTERED when:
 
 It keeps its `last_error`, `attempt_count` and `dead_lettered_at`, emits a webhook, is
 counted in `/metrics` (`deadLettered`), and is **never retried automatically**. The table
-*is* the dead-letter queue: a dead job can be inspected with SQL and fetched by ID.
+*is* the dead-letter queue:
+
+- **Inspect it:** `GET /notifications?status=DEAD_LETTERED` lists it, newest first.
+- **Redrive:** `POST /notifications/:id/retry` sends a dead job back to the queue, due now,
+  with a fresh attempt budget. It is one conditional update
+  (`WHERE status IN ('DEAD_LETTERED', 'FAILED')`), so it cannot touch a job in any other
+  state.
+- **Audit:** each redrive increments `redrive_count`, stamps `last_redriven_at`, and logs
+  `job.redriven` with the previous error. `last_error` is kept as context until the next
+  attempt overwrites it.
+- **Webhooks after a redrive:** the redrive count is also the job's webhook generation.
+  A redriven job that dead-letters again gets a second DEAD_LETTERED event instead of
+  colliding with the first.
 
 ### Poison messages
 
@@ -485,9 +530,8 @@ taking the worker down.
 
 FAILED is kept distinct from DEAD_LETTERED on purpose. FAILED means the provider said no
 (retrying cannot help); DEAD_LETTERED means the provider kept failing (retrying later
-might). An operator treats them differently. A manual redrive endpoint is listed under
-future improvements; it would be an explicit, audited transition, not a loophole in the
-state machine.
+might). An operator treats them differently; both can be redriven, but a FAILED job should only
+be redriven once whatever the provider rejected has been fixed.
 
 ## 13. Rate limiting
 
@@ -637,6 +681,8 @@ smoke test).
 | Webhook POST succeeds but recording it fails | Counted as delivered, not as a failure; redelivered after the lease and deduplicated | POST and bookkeeping handled separately |
 | NUL character in the request | 400, not a 500 from PostgreSQL | `NoNullCharacters` validator |
 | Recipient rate limited | Job stays queued until a slot frees; no attempt used | `deferRateLimited` |
+| Client cancels while a worker claims the same job | Exactly one wins: cancelled and never sent, or sent and the cancel gets 409 | One conditional UPDATE each; the row lock orders them |
+| A redriven job dead-letters again | A second DEAD_LETTERED webhook | Webhook uniqueness includes the redrive generation |
 | Two workers race for a recipient's last slot | Only one is admitted | Per-recipient advisory lock |
 | Database unavailable | API returns 500 (details logged, not returned); `/health` returns 503; workers log `worker.poll_failed` and keep retrying | Error filter; terminus; poll loop catches and reschedules |
 | Worker receives SIGTERM | Running jobs finish; unstarted jobs released at once | `beforeApplicationShutdown` drain |
@@ -794,9 +840,10 @@ In the order they would bite:
 
 ## 22. Future improvements
 
-- **Manual redrive** of DEAD_LETTERED and FAILED jobs: an admin endpoint that performs an
-  explicit, audited transition back to PENDING with a fresh attempt budget.
-- **Cancellation** of a PENDING job (`DELETE /notifications/:id`), fenced the same way.
+- **Authorisation for operator actions**: cancel and redrive should require an operator
+  role, and redrive a reason, stored alongside the audit fields.
+- **Bulk redrive** (`POST /notifications/retry?status=DEAD_LETTERED&since=…`) after an
+  outage, rate-limited so it does not stampede the provider.
 - **Rate-limit-aware claiming** to remove hot-recipient churn (section 20).
 - **Signed webhooks** (HMAC-SHA256 of the body with a shared secret, plus a timestamp to
   stop replays).
@@ -805,7 +852,6 @@ In the order they would bite:
   failures, claim latency).
 - **Per-channel providers** behind the same interface, with per-provider timeouts and
   concurrency.
-- **Cursor-paginated listing** of jobs by recipient or status for support tooling.
 - **Authentication and per-tenant quotas** on the API.
 
 ## 23. Design questions, answered
@@ -856,7 +902,8 @@ assumptions made, why each is reasonable here, and what changes in production.
 | **Recipient identity is the string as given.** `A@example.com` and `a@example.com` are different recipients for rate limiting, and addresses are not validated per channel. | Normalisation rules differ by channel and provider | Normalise per channel (lower-case emails, E.164 phone numbers) before storing |
 | **One rate limit for everyone**: N per recipient per window, across all channels, counting admissions rather than successful deliveries. | Matches the brief's "N per recipient per hour"; counting admissions is the conservative choice | Per-channel or per-tenant limits; possibly count only successful sends |
 | **Webhooks fire for terminal states only** (SENT, FAILED, DEAD_LETTERED), to one global `WEBHOOK_URL`, unsigned. | These are the status changes the brief names | Per-tenant or per-job URLs, HMAC signatures, possibly PENDING/PROCESSING events |
-| **The dead-letter queue is a status**, not a separate table or topic, and there is no redrive endpoint. | A status is queryable, indexed and consistent with the job's history; redrive is an operator action outside the brief | An audited redrive endpoint (section 22) |
+| **The dead-letter queue is a status**, not a separate table or topic. | A status is queryable, indexed and consistent with the job's history, and a redrive is one conditional update | Unchanged; add authorisation and a required reason to redrive (section 22) |
+| **Cancel and redrive are open to any caller**, like the rest of the API. | There is no authentication anywhere in the assessment | Operator-only, with the acting user recorded |
 | **No authentication or multi-tenancy.** | Out of scope for the brief | Authentication on every endpoint, tenant ID on every row, per-tenant quotas |
 | **Payloads are opaque JSON** up to 64 KB, not validated against a per-channel schema. | The system transports notifications; rendering them is the provider's job | Per-channel schemas (subject and body for email, length limits for SMS) |
 | **Scheduling horizon is 365 days**; a `sendAt` in the past is due immediately. | Guards against typos (year 2099) while tolerating client clock skew | Configurable per tenant |

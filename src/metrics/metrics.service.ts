@@ -18,6 +18,7 @@ export class MetricsService {
       sent: count(JobStatus.Sent),
       failed: count(JobStatus.Failed),
       deadLettered: count(JobStatus.DeadLettered),
+      cancelled: count(JobStatus.Cancelled),
       queueLagSeconds: Math.round(queueLagSeconds * 1000) / 1000,
       webhooks,
     };

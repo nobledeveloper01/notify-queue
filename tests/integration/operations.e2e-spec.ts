@@ -47,6 +47,7 @@ describe('Operations endpoints and logging (HTTP + PostgreSQL)', () => {
         sent: 1,
         failed: 0,
         deadLettered: 0,
+        cancelled: 0,
         queueLagSeconds: expect.any(Number),
         webhooks: { pending: 1, delivered: 0, givenUp: 0 },
       });

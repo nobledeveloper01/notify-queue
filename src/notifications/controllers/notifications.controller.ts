@@ -1,4 +1,16 @@
-import { Body, Controller, Get, HttpStatus, Param, ParseUUIDPipe, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  Res,
+} from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiBody,
@@ -17,6 +29,8 @@ import {
   REQUEST_ID_HEADER,
 } from '../../common/constants/app.constants.js';
 import { ErrorResponseDto } from '../../common/dto/error-response.dto.js';
+import { ListNotificationsQueryDto } from '../dto/list-notifications-query.dto.js';
+import { NotificationPageDto } from '../dto/notification-page.dto.js';
 import { NotificationResponseDto } from '../dto/notification-response.dto.js';
 import { ScheduleNotificationDto } from '../dto/schedule-notification.dto.js';
 import { NotificationsService } from '../services/notifications.service.js';
@@ -56,6 +70,51 @@ export class NotificationsController {
     res.status(created ? HttpStatus.CREATED : HttpStatus.OK);
     res.setHeader(IDEMPOTENT_REPLAYED_HEADER, String(!created));
     return notification;
+  }
+
+  @Get()
+  @ApiOperation({
+    summary: 'List notification jobs',
+    description:
+      'Newest first, filtered by status and/or recipient, paginated with an opaque cursor. For example `?status=DEAD_LETTERED` lists the dead-letter queue.',
+  })
+  @ApiOkResponse({ type: NotificationPageDto })
+  @ApiBadRequestResponse({ type: ErrorResponseDto, description: 'Invalid filter or cursor.' })
+  list(@Query() query: ListNotificationsQueryDto): Promise<NotificationPageDto> {
+    return this.notificationsService.list(query);
+  }
+
+  @Delete(':id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Cancel a pending notification',
+    description:
+      'Only a PENDING job can be cancelled; once a worker has claimed it, the answer is 409. Cancelling an already cancelled job returns it unchanged.',
+  })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOkResponse({ type: NotificationResponseDto, description: 'Now CANCELLED.' })
+  @ApiNotFoundResponse({ type: ErrorResponseDto })
+  @ApiConflictResponse({ type: ErrorResponseDto, description: 'Already processing or finished.' })
+  cancel(@Param('id', ParseUUIDPipe) id: string): Promise<NotificationResponseDto> {
+    return this.notificationsService.cancel(id);
+  }
+
+  @Post(':id/retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Redrive a dead-lettered or failed notification',
+    description:
+      'Sends a DEAD_LETTERED or FAILED job back to the queue, due now, with a fresh attempt budget. The redrive is counted on the job (redriveCount, lastRedrivenAt).',
+  })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOkResponse({ type: NotificationResponseDto, description: 'Now PENDING.' })
+  @ApiNotFoundResponse({ type: ErrorResponseDto })
+  @ApiConflictResponse({
+    type: ErrorResponseDto,
+    description: 'The job is not DEAD_LETTERED or FAILED.',
+  })
+  redrive(@Param('id', ParseUUIDPipe) id: string): Promise<NotificationResponseDto> {
+    return this.notificationsService.redrive(id);
   }
 
   @Get(':id')

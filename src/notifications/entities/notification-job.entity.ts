@@ -100,6 +100,16 @@ export class NotificationJob {
   @Column({ name: 'dead_lettered_at', type: 'timestamptz', nullable: true })
   deadLetteredAt: Date | null;
 
+  @Column({ name: 'cancelled_at', type: 'timestamptz', nullable: true })
+  cancelledAt: Date | null;
+
+  /** Times an operator sent this job back to the queue after it failed or dead-lettered. */
+  @Column({ name: 'redrive_count', type: 'integer', default: 0 })
+  redriveCount: number;
+
+  @Column({ name: 'last_redriven_at', type: 'timestamptz', nullable: true })
+  lastRedrivenAt: Date | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 

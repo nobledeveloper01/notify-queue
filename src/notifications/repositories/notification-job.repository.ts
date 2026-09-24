@@ -9,7 +9,11 @@ import { runQuery } from '../../database/query.util.js';
 import type { JobPriority } from '../../common/enums/job-priority.enum.js';
 import { JobStatus } from '../../common/enums/job-status.enum.js';
 import type { NotificationChannel } from '../../common/enums/notification-channel.enum.js';
-import { isTerminal, sourceStatusesFor } from '../domain/job-state-machine.js';
+import {
+  isTerminal,
+  OPERATOR_TRANSITIONS,
+  sourceStatusesFor,
+} from '../domain/job-state-machine.js';
 import { NotificationJob } from '../entities/notification-job.entity.js';
 
 /** When a job first becomes due: an absolute time, or a delay from the database's now(). */
@@ -36,6 +40,26 @@ export interface ClaimedBatch {
   /** Fencing token shared by every job in this claim; required to finish them. */
   claimToken: string;
   jobs: NotificationJob[];
+}
+
+export interface JobListFilter {
+  status?: JobStatus;
+  recipient?: string;
+  /** Keyset position: return jobs strictly older than this (created_at, id). */
+  after?: JobListPosition;
+  limit: number;
+}
+
+/** A job's place in newest-first order. `createdAt` is PostgreSQL's exact text form. */
+export interface JobListPosition {
+  createdAt: string;
+  id: string;
+}
+
+export interface JobPage {
+  jobs: NotificationJob[];
+  /** Position of the last job returned, when more jobs follow it. */
+  next: JobListPosition | null;
 }
 
 export interface RecoveryOutcome {
@@ -212,6 +236,97 @@ export class NotificationJobRepository {
   }
 
   /**
+   * PENDING → CANCELLED, in one conditional UPDATE. If a worker's claim
+   * transaction holds the row, this waits for it, then re-checks the status
+   * and finds PROCESSING: the claim wins, the cancel reports false. So a job
+   * is either cancelled and never sent, or sent and not cancelled.
+   */
+  async cancelPending(id: string): Promise<boolean> {
+    const result = await this.jobs
+      .createQueryBuilder()
+      .update(NotificationJob)
+      .set({ status: OPERATOR_TRANSITIONS.cancel.to, cancelledAt: () => 'now()' })
+      .where('id = :id', { id })
+      .andWhere('status IN (:...from)', { from: OPERATOR_TRANSITIONS.cancel.from })
+      .execute();
+    return result.affected === 1;
+  }
+
+  /**
+   * DEAD_LETTERED or FAILED → PENDING with a fresh attempt budget, due now.
+   * The redrive is counted and timestamped for audit, and the redrive count
+   * is also the webhook generation, so this job's next terminal event does
+   * not collide with its previous one. `last_error` is kept as context until
+   * the next attempt overwrites it.
+   */
+  async redrive(id: string, maxAttempts: number): Promise<boolean> {
+    const result = await this.jobs
+      .createQueryBuilder()
+      .update(NotificationJob)
+      .set({
+        status: OPERATOR_TRANSITIONS.redrive.to,
+        attemptCount: 0,
+        maxAttempts,
+        reconciliationGranted: false,
+        nextAttemptAt: () => 'now()',
+        failedAt: null,
+        deadLetteredAt: null,
+        redriveCount: () => 'redrive_count + 1',
+        lastRedrivenAt: () => 'now()',
+      })
+      .where('id = :id', { id })
+      .andWhere('status IN (:...from)', { from: OPERATOR_TRANSITIONS.redrive.from })
+      .execute();
+    return result.affected === 1;
+  }
+
+  /**
+   * Newest first, keyset-paginated on (created_at, id): each page is an index
+   * range scan from the previous position, however deep the listing goes,
+   * unlike OFFSET. Backed by (status, created_at, id), (recipient,
+   * created_at) and (created_at, id).
+   */
+  async list(filter: JobListFilter): Promise<JobPage> {
+    const query = this.jobs
+      .createQueryBuilder('job')
+      // Exact timestamp for the cursor: a JS Date would drop microseconds and
+      // skip or repeat jobs created within the same millisecond.
+      .addSelect('job.created_at::text', 'position_created_at')
+      .orderBy('job.created_at', 'DESC')
+      .addOrderBy('job.id', 'DESC')
+      .limit(filter.limit + 1);
+
+    if (filter.status) {
+      query.andWhere('job.status = :status', { status: filter.status });
+    }
+    if (filter.recipient) {
+      query.andWhere('job.recipient = :recipient', { recipient: filter.recipient });
+    }
+    if (filter.after) {
+      query.andWhere(
+        '(job.created_at, job.id) < (CAST(:afterCreatedAt AS timestamptz), CAST(:afterId AS uuid))',
+        { afterCreatedAt: filter.after.createdAt, afterId: filter.after.id },
+      );
+    }
+
+    const { entities, raw } = await query.getRawAndEntities<{
+      job_id: string;
+      position_created_at: string;
+    }>();
+    const jobs = entities.slice(0, filter.limit);
+    const last = jobs.at(-1);
+    const lastRaw = last ? raw.find((row) => row.job_id === last.id) : undefined;
+
+    return {
+      jobs,
+      next:
+        entities.length > filter.limit && last && lastRaw
+          ? { createdAt: lastRaw.position_created_at, id: last.id }
+          : null,
+    };
+  }
+
+  /**
    * Marks the moment a worker actually starts a claimed job, renewing the
    * lease. Jobs wait in a worker's local queue after being claimed; without
    * this, that wait would eat into the lease, and a job reclaimed while
@@ -310,10 +425,11 @@ export class NotificationJobRepository {
            LIMIT $5
            FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, status, attempt_count, updated_at
+        RETURNING id, status, attempt_count, updated_at, redrive_count
        ), events AS (
-         INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at)
-         SELECT id, status, attempt_count, updated_at FROM recovered WHERE status = $2
+         INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at, redrive_count)
+         SELECT id, status, attempt_count, updated_at, redrive_count
+           FROM recovered WHERE status = $2
        )
        SELECT id, status FROM recovered`,
       [
@@ -368,8 +484,9 @@ export class NotificationJobRepository {
       }
       if (isTerminal(to)) {
         await this.run(
-          `INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at)
-           SELECT id, status, attempt_count, updated_at FROM notification_jobs WHERE id = $1`,
+          `INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at, redrive_count)
+           SELECT id, status, attempt_count, updated_at, redrive_count
+             FROM notification_jobs WHERE id = $1`,
           [id],
           manager,
         );

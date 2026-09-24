@@ -27,6 +27,9 @@ export class MetricsResponseDto {
   @ApiProperty({ example: 1 })
   deadLettered: number;
 
+  @ApiProperty({ example: 0 })
+  cancelled: number;
+
   @ApiProperty({
     example: 0.4,
     description:

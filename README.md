@@ -54,6 +54,8 @@ store and the webhook outbox. The design is explained in [DESIGN.md](DESIGN.md).
   PostgreSQL. Waiting for the limit does not use up an attempt.
 - **Webhooks** for SENT, FAILED and DEAD_LETTERED via a transactional outbox: delivered at
   least once, with retries, deduplicable by event ID.
+- **Operator actions**: cancel a pending job, list jobs by status or recipient (including
+  the dead-letter queue), and redrive dead-lettered or failed jobs, with an audit trail.
 - **Graceful shutdown**: workers stop claiming, finish running deliveries, and hand
   unstarted jobs straight back to the queue.
 - **Operations**: `/health` (application and PostgreSQL), `/metrics` (queue depth, queue
@@ -257,7 +259,10 @@ Interactive documentation: **http://localhost:3000/api/docs**
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/notifications` | Schedule a notification |
+| `GET` | `/notifications` | List jobs, newest first; filter by `status`, `recipient`; cursor pagination |
 | `GET` | `/notifications/:id` | A job's status and history |
+| `DELETE` | `/notifications/:id` | Cancel a job that is still PENDING |
+| `POST` | `/notifications/:id/retry` | Redrive a DEAD_LETTERED or FAILED job with a fresh attempt budget |
 | `GET` | `/metrics` | Queue depth, queue lag, webhook backlog |
 | `GET` | `/health` | Application and PostgreSQL health |
 | `POST` | `/webhooks/mock` | Demo webhook receiver |
@@ -322,6 +327,22 @@ curl -s http://localhost:3000/metrics
 curl -s http://localhost:3000/health
 ```
 
+Cancel it while it is still PENDING (409 once a worker has picked it up):
+
+```bash
+curl -s -X DELETE http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c
+```
+
+Work the dead-letter queue: list it, then send a job back with a fresh attempt budget:
+
+```bash
+curl -s 'http://localhost:3000/notifications?status=DEAD_LETTERED&limit=20'
+curl -s -X POST http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c/retry
+```
+
+Lists return `{ "items": [...], "nextCursor": "…" }`; pass `cursor=<nextCursor>` for the
+next page (`null` on the last one). Filters combine: `?recipient=user@example.com&status=SENT`.
+
 Every error has the same shape, and every response carries an `X-Request-ID` (yours, if
 you sent one):
 
@@ -367,6 +388,7 @@ each test is real.
 | `concurrent-idempotency` | 25 simultaneous identical POSTs; two different bodies racing for one key; 8 connection pools inserting at once | One job; exactly one 201; losers of a body race get 409 |
 | `concurrent-rate-limit` | 20 simultaneous admissions for one recipient; 10 workers competing over 40 jobs | Exactly N admitted; no sliding window ever exceeds N |
 | `webhook-dispatch` | 6 dispatchers claiming 60 events at once | Each event POSTed once |
+| `cancel-vs-claim` | 200 jobs cancelled while 5 workers claim them | Every job ends one way: cancelled and never claimed, or claimed and not cancelled |
 
 Each suite was also checked against a deliberately broken implementation (no
 `SKIP LOCKED`, no advisory lock, no `ON CONFLICT`, no fencing token) to confirm it fails
@@ -387,7 +409,9 @@ A failed attempt is classified by the provider:
 
   With the defaults: about 0.5–1 s, 1–2 s, 2–4 s, 4–8 s, 8–16 s.
 - When the last attempt (`MAX_RETRIES + 1`) fails, the job becomes `DEAD_LETTERED` and is
-  never retried automatically.
+  never retried automatically. An operator can list the dead-letter queue
+  (`GET /notifications?status=DEAD_LETTERED`) and send a job back with
+  `POST /notifications/:id/retry`; each redrive is counted on the job.
 
 Attempts are counted when a job is claimed, so a job that crashes every worker that picks
 it up still runs out of attempts. Anything that stops a job before it reaches the provider
