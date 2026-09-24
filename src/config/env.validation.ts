@@ -38,6 +38,16 @@ export enum AppRole {
  * decorator metadata records an unannotated property as `Object`, and
  * class-transformer then leaves `"3"` as a string instead of coercing it.
  */
+export enum LogLevel {
+  Fatal = 'fatal',
+  Error = 'error',
+  Warn = 'warn',
+  Info = 'info',
+  Debug = 'debug',
+  Trace = 'trace',
+  Silent = 'silent',
+}
+
 export class EnvironmentVariables {
   @IsEnum(NodeEnvironment)
   NODE_ENV: NodeEnvironment = NodeEnvironment.Development;
@@ -49,6 +59,9 @@ export class EnvironmentVariables {
   @Min(1)
   @Max(65535)
   PORT: number = 3000;
+
+  @IsEnum(LogLevel)
+  LOG_LEVEL: LogLevel = LogLevel.Info;
 
   @IsString()
   @IsNotEmpty()
@@ -139,6 +152,18 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsUrl({ require_tld: false, protocols: ['http', 'https'] })
   WEBHOOK_URL?: string;
+
+  @IsInt()
+  @Min(1)
+  WEBHOOK_TIMEOUT_MS: number = 5000;
+
+  @IsInt()
+  @Min(1)
+  WEBHOOK_MAX_ATTEMPTS: number = 10;
+
+  @IsInt()
+  @Min(10)
+  WEBHOOK_POLL_INTERVAL_MS: number = 1000;
 }
 
 /**

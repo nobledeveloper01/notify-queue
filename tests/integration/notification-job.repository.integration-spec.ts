@@ -251,6 +251,50 @@ describe('NotificationJobRepository (PostgreSQL)', () => {
     });
   });
 
+  describe('webhook outbox', () => {
+    const events = (jobId: string): Promise<{ status: string; attempt_count: number }[]> =>
+      dataSource.query('SELECT status, attempt_count FROM webhook_events WHERE job_id = $1', [
+        jobId,
+      ]);
+
+    it('writes one event with each terminal status change', async () => {
+      const sent = await repository.insertIfAbsent(newJob());
+      const failed = await repository.insertIfAbsent(newJob());
+      const dead = await repository.insertIfAbsent(newJob());
+      const { claimToken } = await repository.claimDueJobs('worker-a', 3);
+
+      await repository.markSent(sent.job.id, claimToken);
+      await repository.markFailed(failed.job.id, claimToken, 'rejected');
+      await repository.markDeadLettered(dead.job.id, claimToken, 'exhausted');
+
+      expect(await events(sent.job.id)).toEqual([{ status: 'SENT', attempt_count: 1 }]);
+      expect(await events(failed.job.id)).toEqual([{ status: 'FAILED', attempt_count: 1 }]);
+      expect(await events(dead.job.id)).toEqual([{ status: 'DEAD_LETTERED', attempt_count: 1 }]);
+    });
+
+    it('writes nothing for a retry, a release, or a completion whose claim was lost', async () => {
+      const { job } = await repository.insertIfAbsent(newJob());
+      const first = await repository.claimDueJobs('worker-a', 1);
+      await repository.scheduleRetry(job.id, first.claimToken, 0, 'transient');
+      const second = await repository.claimDueJobs('worker-a', 1);
+      await repository.releaseClaim(job.id, second.claimToken);
+
+      await repository.markSent(job.id, first.claimToken);
+
+      expect(await events(job.id)).toEqual([]);
+    });
+
+    it('writes an event when recovery dead-letters an expired final attempt', async () => {
+      const { job } = await repository.insertIfAbsent(newJob({ maxAttempts: 1 }));
+      await repository.claimDueJobs('worker-a', 1);
+      await ageClaim(job.id, 600);
+
+      await repository.recoverStaleClaims(300, 100);
+
+      expect(await events(job.id)).toEqual([{ status: 'DEAD_LETTERED', attempt_count: 1 }]);
+    });
+  });
+
   describe('recoverStaleClaims', () => {
     it('requeues expired claims and leaves live ones alone', async () => {
       const stale = await repository.insertIfAbsent(newJob());

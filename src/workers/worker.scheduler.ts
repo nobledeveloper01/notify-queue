@@ -4,11 +4,13 @@ import { ConfigService } from '@nestjs/config';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import type { AppConfig, WorkerConfig } from '../config/configuration.js';
 import { AppRole } from '../config/env.validation.js';
+import { WebhookService } from '../webhooks/webhook.service.js';
 import { WorkerRecoveryService } from './worker-recovery.service.js';
 import { WorkerService } from './worker.service.js';
 
 const POLL_TIMEOUT = 'worker-poll';
 const RECOVERY_INTERVAL = 'worker-recovery';
+const WEBHOOK_INTERVAL = 'webhook-dispatch';
 
 /**
  * Drives the worker loop; holds no job logic itself.
@@ -23,6 +25,7 @@ const RECOVERY_INTERVAL = 'worker-recovery';
 export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicationShutdown {
   private readonly logger = new Logger(WorkerScheduler.name);
   private readonly config: WorkerConfig;
+  private readonly webhookPollIntervalMs: number;
   private readonly enabled: boolean;
   private running = false;
   private currentTick: Promise<void> = Promise.resolve();
@@ -31,9 +34,11 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
     private readonly registry: SchedulerRegistry,
     private readonly worker: WorkerService,
     private readonly recovery: WorkerRecoveryService,
+    private readonly webhooks: WebhookService,
     config: ConfigService<AppConfig, true>,
   ) {
     this.config = config.get('worker', { infer: true });
+    this.webhookPollIntervalMs = config.get('webhook', { infer: true }).pollIntervalMs;
     this.enabled = config.get('role', { infer: true }) !== AppRole.Api;
   }
 
@@ -56,6 +61,12 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       setInterval(() => void this.recoverSafely(), this.config.recoveryIntervalMs),
     );
     void this.recoverSafely();
+    if (this.webhooks.enabled) {
+      this.registry.addInterval(
+        WEBHOOK_INTERVAL,
+        setInterval(() => void this.dispatchWebhooksSafely(), this.webhookPollIntervalMs),
+      );
+    }
     this.scheduleNextPoll(0);
   }
 
@@ -64,8 +75,8 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
     this.running = false;
 
     if (this.registry.doesExist('timeout', POLL_TIMEOUT)) this.registry.deleteTimeout(POLL_TIMEOUT);
-    if (this.registry.doesExist('interval', RECOVERY_INTERVAL)) {
-      this.registry.deleteInterval(RECOVERY_INTERVAL);
+    for (const name of [RECOVERY_INTERVAL, WEBHOOK_INTERVAL]) {
+      if (this.registry.doesExist('interval', name)) this.registry.deleteInterval(name);
     }
 
     await this.currentTick;
@@ -99,6 +110,18 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       });
     }
     this.scheduleNextPoll(nextDelay);
+  }
+
+  private async dispatchWebhooksSafely(): Promise<void> {
+    try {
+      await this.webhooks.dispatchDue();
+    } catch (error: unknown) {
+      this.logger.error({
+        event: 'webhook.dispatch_failed',
+        workerId: this.config.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async recoverSafely(): Promise<void> {

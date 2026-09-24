@@ -3,6 +3,7 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import type { EntityManager } from 'typeorm';
 import { RATE_LIMIT_LOCK_NAMESPACE } from '../../common/constants/rate-limit.constants.js';
+import { runQuery } from '../../database/query.util.js';
 
 export interface RecentUsage {
   /** Reservations inside the window. */
@@ -48,13 +49,13 @@ export class RecipientRateLimitRepository {
 
   /** Deletes reservations that can no longer affect any decision. Returns how many. */
   async pruneExpired(windowSeconds: number): Promise<number> {
-    const rows: { job_id: string }[] = await this.dataSource.query(
+    const { affected } = await runQuery(
+      this.dataSource,
       `DELETE FROM rate_limit_reservations
-        WHERE reserved_at <= now() - make_interval(secs => $1)
-        RETURNING job_id`,
+        WHERE reserved_at <= now() - make_interval(secs => $1)`,
       [windowSeconds],
     );
-    return rows.length;
+    return affected ?? 0;
   }
 
   private scope(manager: EntityManager): RecipientLockScope {

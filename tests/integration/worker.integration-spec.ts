@@ -4,6 +4,7 @@ import type { DataSource } from 'typeorm';
 import { JobStatus } from '../../src/common/enums/job-status.enum.js';
 import type { NotificationProvider } from '../../src/delivery/providers/notification-provider.interface.js';
 import { NotificationJobRepository } from '../../src/notifications/repositories/notification-job.repository.js';
+import { RateLimitService } from '../../src/rate-limit/rate-limit.service.js';
 import { WorkerRecoveryService } from '../../src/workers/worker-recovery.service.js';
 import { WorkerService } from '../../src/workers/worker.service.js';
 import { newJob } from '../support/job.factory.js';
@@ -269,6 +270,21 @@ describe('Worker (PostgreSQL)', () => {
         'SELECT count(*) FROM rate_limit_reservations',
       );
       expect(count).toBe('0');
+    });
+
+    it('reports how many expired reservations it pruned', async () => {
+      await startWorker(new AlwaysSuccessProvider(), { RATE_LIMIT_WINDOW_SECONDS: '1' });
+      // Three expired, one live. Not two: the old bug returned 2 whatever was pruned.
+      const inserted = await Promise.all([1, 2, 3, 4].map(() => jobs.insertIfAbsent(newJob())));
+      for (const [i, { job: j }] of inserted.entries()) {
+        await dataSource.query(
+          `INSERT INTO rate_limit_reservations (job_id, recipient, reserved_at)
+           VALUES ($1, $2, now() - make_interval(secs => $3))`,
+          [j.id, j.recipient, i === 0 ? 0 : 10],
+        );
+      }
+
+      await expect(app?.get(RateLimitService).pruneExpired()).resolves.toBe(3);
     });
   });
 

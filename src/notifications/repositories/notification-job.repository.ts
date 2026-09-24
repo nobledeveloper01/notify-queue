@@ -5,10 +5,11 @@ import { DataSource, In } from 'typeorm';
 import type { EntityManager, QueryResult, Repository } from 'typeorm';
 import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity.js';
 import { JOB_PRIORITY_RANK } from '../../common/enums/job-priority.enum.js';
+import { runQuery } from '../../database/query.util.js';
 import type { JobPriority } from '../../common/enums/job-priority.enum.js';
 import { JobStatus } from '../../common/enums/job-status.enum.js';
 import type { NotificationChannel } from '../../common/enums/notification-channel.enum.js';
-import { sourceStatusesFor } from '../domain/job-state-machine.js';
+import { isTerminal, sourceStatusesFor } from '../domain/job-state-machine.js';
 import { NotificationJob } from '../entities/notification-job.entity.js';
 
 /** When a job first becomes due: an absolute time, or a delay from the database's now(). */
@@ -252,8 +253,11 @@ export class NotificationJobRepository {
     visibilityTimeoutSeconds: number,
     limit: number,
   ): Promise<RecoveryOutcome> {
+    // One statement: requeue or dead-letter the expired claims, and write the
+    // outbox event for every dead-lettered one, atomically.
     const { records } = await this.run<{ id: string; status: JobStatus }>(
-      `UPDATE notification_jobs
+      `WITH recovered AS (
+       UPDATE notification_jobs
           SET status = CASE WHEN attempt_count >= max_attempts
                             THEN $2 ELSE $3 END,
               dead_lettered_at = CASE WHEN attempt_count >= max_attempts
@@ -273,7 +277,12 @@ export class NotificationJobRepository {
            LIMIT $5
            FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, status`,
+        RETURNING id, status, attempt_count, updated_at
+       ), events AS (
+         INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at)
+         SELECT id, status, attempt_count, updated_at FROM recovered WHERE status = $2
+       )
+       SELECT id, status FROM recovered`,
       [
         JobStatus.Processing,
         JobStatus.DeadLettered,
@@ -296,6 +305,10 @@ export class NotificationJobRepository {
    * state machine allows to move to `to`. Zero rows updated means the claim
    * was lost (lease expired and reclaimed), and the caller must not assume
    * its outcome was recorded.
+   *
+   * A move to a terminal status writes its webhook event in the same
+   * transaction (the outbox), so the event exists exactly when the status
+   * change does.
    */
   private async completeClaim(
     id: string,
@@ -304,33 +317,37 @@ export class NotificationJobRepository {
     changes: QueryDeepPartialEntity<NotificationJob>,
     parameters: Record<string, unknown> = {},
   ): Promise<boolean> {
-    const result = await this.jobs
-      .createQueryBuilder()
-      .update(NotificationJob)
-      .set({ ...changes, status: to, lockedBy: null, lockedAt: null, claimToken: null })
-      .where('id = :id', { id })
-      .andWhere('claim_token = :claimToken', { claimToken })
-      .andWhere('status IN (:...from)', { from: sourceStatusesFor(to) })
-      .setParameters(parameters)
-      .execute();
+    return this.dataSource.transaction(async (manager) => {
+      const result = await manager
+        .createQueryBuilder()
+        .update(NotificationJob)
+        .set({ ...changes, status: to, lockedBy: null, lockedAt: null, claimToken: null })
+        .where('id = :id', { id })
+        .andWhere('claim_token = :claimToken', { claimToken })
+        .andWhere('status IN (:...from)', { from: sourceStatusesFor(to) })
+        .setParameters(parameters)
+        .execute();
 
-    return result.affected === 1;
+      if (result.affected !== 1) {
+        return false;
+      }
+      if (isTerminal(to)) {
+        await this.run(
+          `INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at)
+           SELECT id, status, attempt_count, updated_at FROM notification_jobs WHERE id = $1`,
+          [id],
+          manager,
+        );
+      }
+      return true;
+    });
   }
 
-  /** Runs raw SQL and returns rows plus affected count, inside `manager`'s transaction if given. */
-  private async run<T = unknown>(
+  private run<T = unknown>(
     sql: string,
     parameters: unknown[],
     manager?: EntityManager,
   ): Promise<QueryResult<T>> {
-    if (manager?.queryRunner) {
-      return manager.queryRunner.query(sql, parameters, true) as Promise<QueryResult<T>>;
-    }
-    const queryRunner = this.dataSource.createQueryRunner();
-    try {
-      return (await queryRunner.query(sql, parameters, true)) as QueryResult<T>;
-    } finally {
-      await queryRunner.release();
-    }
+    return runQuery<T>(this.dataSource, sql, parameters, manager);
   }
 }

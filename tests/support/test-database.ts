@@ -40,6 +40,7 @@ export const createTestDataSource = async (poolMax = 10): Promise<DataSource> =>
 
 export const truncateAll = async (dataSource: DataSource): Promise<void> => {
   await dataSource.query(
-    'TRUNCATE notification_jobs, mock_provider_deliveries, rate_limit_reservations',
+    `TRUNCATE notification_jobs, mock_provider_deliveries, rate_limit_reservations,
+              webhook_events, mock_webhook_receipts`,
   );
 };

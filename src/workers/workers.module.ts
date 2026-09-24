@@ -3,6 +3,7 @@ import { DeliveryModule } from '../delivery/delivery.module.js';
 import { NotificationsModule } from '../notifications/notifications.module.js';
 import { RateLimitModule } from '../rate-limit/rate-limit.module.js';
 import { RetryModule } from '../retry/retry.module.js';
+import { WebhooksModule } from '../webhooks/webhooks.module.js';
 import { JobClaimService } from './job-claim.service.js';
 import { JobProcessorService } from './job-processor.service.js';
 import { WorkerRecoveryService } from './worker-recovery.service.js';
@@ -10,7 +11,7 @@ import { WorkerScheduler } from './worker.scheduler.js';
 import { WorkerService } from './worker.service.js';
 
 @Module({
-  imports: [NotificationsModule, DeliveryModule, RateLimitModule, RetryModule],
+  imports: [NotificationsModule, DeliveryModule, RateLimitModule, RetryModule, WebhooksModule],
   providers: [
     JobClaimService,
     JobProcessorService,

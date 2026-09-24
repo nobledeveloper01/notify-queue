@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { validateEnv } from './env.validation.js';
-import type { AppRole, EnvironmentVariables, NodeEnvironment } from './env.validation.js';
+import type { AppRole, EnvironmentVariables, LogLevel, NodeEnvironment } from './env.validation.js';
 
 export interface DatabaseConfig {
   host: string;
@@ -39,16 +39,25 @@ export interface RateLimitConfig {
   windowSeconds: number;
 }
 
+export interface WebhookConfig {
+  /** Unset disables dispatch; events are still recorded in the outbox. */
+  url?: string;
+  timeoutMs: number;
+  maxAttempts: number;
+  pollIntervalMs: number;
+}
+
 export interface AppConfig {
   nodeEnv: NodeEnvironment;
   role: AppRole;
   port: number;
+  logLevel: LogLevel;
   database: DatabaseConfig;
   worker: WorkerConfig;
   retry: RetryConfig;
   rateLimit: RateLimitConfig;
   delivery: DeliveryConfig;
-  webhookUrl?: string;
+  webhook: WebhookConfig;
 }
 
 /**
@@ -59,6 +68,7 @@ export const buildConfig = (env: EnvironmentVariables): AppConfig => ({
   nodeEnv: env.NODE_ENV,
   role: env.APP_ROLE,
   port: env.PORT,
+  logLevel: env.LOG_LEVEL,
   database: {
     host: env.DATABASE_HOST,
     port: env.DATABASE_PORT,
@@ -90,7 +100,12 @@ export const buildConfig = (env: EnvironmentVariables): AppConfig => ({
     mockFailureRate: env.MOCK_FAILURE_RATE,
     mockLatencyMs: env.MOCK_LATENCY_MS,
   },
-  webhookUrl: env.WEBHOOK_URL,
+  webhook: {
+    url: env.WEBHOOK_URL,
+    timeoutMs: env.WEBHOOK_TIMEOUT_MS,
+    maxAttempts: env.WEBHOOK_MAX_ATTEMPTS,
+    pollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
+  },
 });
 
 /** ConfigModule `load` factory: validate once at boot, then expose typed config. */

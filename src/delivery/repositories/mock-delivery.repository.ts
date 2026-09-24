@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
+import { runQuery } from '../../database/query.util.js';
 import type { NotificationChannel } from '../../common/enums/notification-channel.enum.js';
 
 export interface RecordedDelivery {
@@ -28,7 +29,8 @@ export class MockDeliveryRepository {
     recipient: string,
     channel: NotificationChannel,
   ): Promise<RecordedDelivery> {
-    const inserted: { message_id: string }[] = await this.dataSource.query(
+    const { records: inserted } = await runQuery<{ message_id: string }>(
+      this.dataSource,
       `INSERT INTO mock_provider_deliveries (delivery_key, recipient, channel)
        VALUES ($1, $2, $3)
        ON CONFLICT (delivery_key) DO NOTHING

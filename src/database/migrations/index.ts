@@ -2,6 +2,7 @@ import { CreateNotificationJobs1790208000000 } from './1790208000000-create-noti
 import { AddRequestFingerprint1790294400000 } from './1790294400000-add-request-fingerprint.js';
 import { CreateMockProviderDeliveries1790380800000 } from './1790380800000-create-mock-provider-deliveries.js';
 import { CreateRateLimitReservations1790467200000 } from './1790467200000-create-rate-limit-reservations.js';
+import { CreateWebhookOutbox1790553600000 } from './1790553600000-create-webhook-outbox.js';
 
 /**
  * Registered explicitly rather than by file glob: the same list works from
@@ -13,4 +14,5 @@ export const migrations = [
   AddRequestFingerprint1790294400000,
   CreateMockProviderDeliveries1790380800000,
   CreateRateLimitReservations1790467200000,
+  CreateWebhookOutbox1790553600000,
 ];

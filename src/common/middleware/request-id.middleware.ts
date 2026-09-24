@@ -4,7 +4,7 @@ import { Injectable } from '@nestjs/common';
 import type { NestMiddleware } from '@nestjs/common';
 import { REQUEST_ID_HEADER } from '../constants/app.constants.js';
 
-declare module 'node:http' {
+declare module 'http' {
   interface IncomingMessage {
     requestId?: string;
   }
