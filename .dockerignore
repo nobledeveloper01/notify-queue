@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+tests
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea
+.vscode
+docker-compose.yml
+Dockerfile

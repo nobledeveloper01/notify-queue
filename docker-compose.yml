@@ -1,5 +1,25 @@
 name: notify-queue
 
+# docker compose up --build                  one API, one worker
+# docker compose up --build --scale worker=3 horizontally scaled workers
+# docker compose --profile seed run --rm seed   load demo data (after migrate)
+
+x-app: &app
+  build: .
+  image: notify-queue:local
+  init: true # tini as PID 1: forwards SIGTERM so workers drain, reaps zombies
+  environment: &app-env
+    DATABASE_HOST: postgres
+    DATABASE_PORT: 5432
+    DATABASE_NAME: notify_queue
+    DATABASE_USER: postgres
+    DATABASE_PASSWORD: postgres
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.2}
+    RATE_LIMIT_MAX_NOTIFICATIONS: ${RATE_LIMIT_MAX_NOTIFICATIONS:-10}
+    RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-3600}
+    WEBHOOK_URL: http://api:3000/webhooks/mock
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -20,6 +40,54 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+
+  # Runs pending migrations once, then exits. api and worker start only after
+  # it succeeds: several containers migrating at once would race each other.
+  migrate:
+    <<: *app
+    command: ['node', 'node_modules/typeorm/cli.js', 'migration:run', '-d', 'dist/database/data-source.js']
+    healthcheck:
+      disable: true
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_ROLE: api
+    ports:
+      - '${API_HOST_PORT:-3000}:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_ROLE: worker
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-100}
+    # No published port: any number of replicas can run side by side.
+    # Longer than WORKER_SHUTDOWN_TIMEOUT_MS (30s) so the drain can finish.
+    stop_grace_period: 35s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  seed:
+    <<: *app
+    profiles: [seed]
+    command: ['node', 'dist/database/seeds/run-seed.js', 'seed.sql']
+    healthcheck:
+      disable: true
+    restart: 'no'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

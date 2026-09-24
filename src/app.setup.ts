@@ -11,7 +11,12 @@ export const SWAGGER_PATH = 'api/docs';
  */
 export const configureApp = (app: NestExpressApplication): void => {
   app.useBodyParser('json', { limit: JSON_BODY_LIMIT });
-  app.enableShutdownHooks();
+  // useProcessExit: after the shutdown hooks finish, exit through
+  // process.exit(0) rather than re-raising the signal. pino writes
+  // asynchronously and flushes on the 'exit' event, which a re-raised SIGTERM
+  // skips, so the last log lines (including the worker's drain report) would
+  // be lost under load. It also makes a clean shutdown exit 0 instead of 143.
+  app.enableShutdownHooks([], { useProcessExit: true });
 
   const document = SwaggerModule.createDocument(
     app,
