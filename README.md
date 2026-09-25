@@ -20,7 +20,7 @@ a dead-letter queue instead of retrying forever.
 - [Run it with Docker (quickest)](#run-it-with-docker-quickest)
 - [Run it locally with npm](#run-it-locally-with-npm)
 - [Run several workers locally](#run-several-workers-locally)
-- [Using the API](#using-the-api)
+- [API reference](#api-reference)
 - [Tests](#tests)
 - [Settings](#settings)
 - [Known limitations](#known-limitations)
@@ -153,13 +153,113 @@ it names the worker in the logs.
 When you stop a worker with Ctrl+C, it finishes the notifications it is currently sending,
 returns any it has not started to the queue, and then exits.
 
-## Using the API
+## API reference
 
-The easiest way to try the API is Swagger, at **http://localhost:3000/api/docs**. Open an
-endpoint, click **Try it out**, and then click **Execute**. The examples below use `curl`
-instead.
+This section describes every endpoint, with a sample request and the response it returns,
+so you can see the whole API without running the project. All the responses below were
+captured from the running service. Only the IDs and times will differ on your machine.
 
-**Schedule a notification** to be sent in 60 seconds:
+To try the endpoints yourself, open Swagger at **http://localhost:3000/api/docs**, choose an
+endpoint, click **Try it out**, and then click **Execute**.
+
+**Base URL:** `http://localhost:3000`. Requests and responses are JSON. There is no
+authentication (see [Known limitations](#known-limitations)).
+
+### Endpoints at a glance
+
+| Method | Path | Purpose | Success |
+| --- | --- | --- | --- |
+| `POST` | [`/notifications`](#schedule-a-notification) | Schedule a notification | `201`, or `200` for a repeat |
+| `GET` | [`/notifications/{id}`](#get-a-notification) | Get one notification and its status | `200` |
+| `GET` | [`/notifications`](#list-notifications) | List notifications, filtered by status and/or recipient | `200` |
+| `DELETE` | [`/notifications/{id}`](#cancel-a-notification) | Cancel a notification that has not been sent | `200` |
+| `POST` | [`/notifications/{id}/retry`](#retry-one-notification) | Retry one dead-lettered or failed notification | `200` |
+| `POST` | [`/notifications/retry`](#retry-many-notifications) | Retry many dead-lettered or failed notifications at once | `200` |
+| `GET` | [`/metrics`](#metrics) | Counts by status, and how long the oldest due notification has waited | `200` |
+| `GET` | [`/health`](#health) | Whether the service and the database are working | `200`, or `503` |
+| `POST` | [`/webhooks/mock`](#mock-webhook-receiver) | A demo receiver for webhook calls | `200` |
+
+### The notification object
+
+Most endpoints return a notification in this form:
+
+```json
+{
+  "id": "3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c",
+  "idempotencyKey": "welcome-user-123",
+  "recipient": "user@example.com",
+  "channel": "EMAIL",
+  "priority": "HIGH",
+  "status": "PENDING",
+  "scheduledAt": "2026-09-25T09:01:00.000Z",
+  "nextAttemptAt": "2026-09-25T09:01:00.000Z",
+  "attemptCount": 0,
+  "maxAttempts": 6,
+  "lastError": null,
+  "sentAt": null,
+  "failedAt": null,
+  "deadLetteredAt": null,
+  "cancelledAt": null,
+  "redriveCount": 0,
+  "lastRedrivenAt": null,
+  "createdAt": "2026-09-25T09:00:00.000Z",
+  "updatedAt": "2026-09-25T09:00:00.000Z"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The notification's ID. Use it in the other endpoints |
+| `status` | `PENDING` (waiting), `PROCESSING` (being sent), `SENT`, `FAILED` (can never be delivered), `DEAD_LETTERED` (kept failing) or `CANCELLED` |
+| `scheduledAt` | When the notification was first due |
+| `nextAttemptAt` | When it is next due. This moves forward after a failed attempt |
+| `attemptCount` / `maxAttempts` | Delivery attempts made so far, and the most allowed (1 attempt and 5 retries) |
+| `lastError` | The error from the most recent failed attempt, or `null` |
+| `sentAt`, `failedAt`, `deadLetteredAt`, `cancelledAt` | When it reached that final status, or `null` |
+| `redriveCount` / `lastRedrivenAt` | How many times an operator has retried it, and when |
+
+The message content (`payload`) is never returned, and it is never written to the logs.
+
+### Errors
+
+Every error has the same form. `details` appears only when the request failed validation,
+and it lists every problem at once:
+
+```json
+{
+  "statusCode": 400,
+  "error": "Bad Request",
+  "message": "Validation failed",
+  "details": [
+    {
+      "field": "channel",
+      "errors": ["channel must be one of the following values: EMAIL, SMS, PUSH"]
+    },
+    {
+      "field": "sendAt",
+      "errors": ["Provide exactly one of sendAt or delaySeconds"]
+    }
+  ],
+  "path": "/notifications",
+  "requestId": "280d8632-55aa-4cfa-b884-51a117549d58"
+}
+```
+
+| Code | Meaning |
+| --- | --- |
+| `400` | The request is invalid. The response explains why |
+| `404` | No notification has that `id` |
+| `409` | The action is not allowed in the notification's current status, or the idempotency key was already used for a different request |
+| `500` | An unexpected error. The details are logged on the server, never returned |
+
+Every response, including errors, has an `X-Request-ID` header. The same ID appears in the
+logs, so a problem can be traced. You can also send your own `X-Request-ID`.
+
+### Schedule a notification
+
+`POST /notifications`
+
+Send the notification after a delay:
 
 ```bash
 curl -X POST http://localhost:3000/notifications \
@@ -174,98 +274,315 @@ curl -X POST http://localhost:3000/notifications \
   }'
 ```
 
-- `channel` is `EMAIL`, `SMS` or `PUSH`.
-- Send either `delaySeconds` or `sendAt` (for example `"2026-12-01T09:00:00Z"`), not both.
-- `idempotencyKey` is a unique key that you choose for this notification. If you send the
-  same request again with the same key, no second notification is created.
+Or at a set time:
 
-The response contains the notification's `id`. Use that `id` in the requests below. (The
-`id` shown in these examples is only a placeholder.)
-
-**Check a notification's status:**
-
-```bash
-curl http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c
+```json
+{
+  "recipient": "+2348012345678",
+  "channel": "SMS",
+  "payload": { "body": "Your appointment is tomorrow at 9:00." },
+  "priority": "NORMAL",
+  "sendAt": "2026-12-01T08:00:00Z",
+  "idempotencyKey": "appointment-reminder-42"
+}
 ```
 
-A notification moves from `PENDING` (waiting) to `PROCESSING` (being sent) to `SENT`. It can
-also end as `FAILED` (it can never be delivered), `DEAD_LETTERED` (it kept failing) or
-`CANCELLED`.
+| Field | Required | Rules |
+| --- | --- | --- |
+| `recipient` | Yes | An email address, phone number or device token. Up to 320 characters |
+| `channel` | Yes | `EMAIL`, `SMS` or `PUSH` |
+| `payload` | Yes | A JSON object with the message content |
+| `priority` | Yes | `HIGH`, `NORMAL` or `LOW` |
+| `delaySeconds` | One of these two | Seconds from now: at least 1, and at most 365 days (31,536,000) |
+| `sendAt` | One of these two | A date and time with a timezone, for example `2026-12-01T08:00:00Z`. Up to 365 days ahead |
+| `idempotencyKey` | Yes | A unique key you choose for this notification. Up to 255 characters |
 
-**List notifications**, newest first. You can filter by status, by recipient, or both:
+**Response `201 Created`:** the new notification (see [the notification object](#the-notification-object)).
 
-```bash
-curl 'http://localhost:3000/notifications?status=DEAD_LETTERED'
+**Sending the same request again** with the same key returns **`200 OK`** and the original
+notification, with the header `Idempotent-Replayed: true`. No second notification is
+created, so a client can safely retry after a timeout.
+
+**Reusing a key for a different request** returns **`409 Conflict`**:
+
+```json
+{
+  "statusCode": 409,
+  "error": "Conflict",
+  "message": "Idempotency key \"welcome-user-123\" was already used for a different notification request",
+  "path": "/notifications",
+  "requestId": "4e1c3ec0-fefc-4a23-8674-eb5908cab31e"
+}
 ```
 
-Long lists are returned in pages. Each page includes a `nextCursor` value; pass it as
-`&cursor=...` to get the next page.
+### Get a notification
 
-**Cancel** a notification that has not been sent yet:
-
-```bash
-curl -X DELETE http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c
-```
-
-**Retry** a notification from the dead-letter queue (or one that failed):
+`GET /notifications/{id}`
 
 ```bash
-curl -X POST http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c/retry
+curl http://localhost:3000/notifications/1948de39-9858-4590-8610-9801d989dc59
 ```
 
-**Retry many at once**, for example the whole dead-letter queue after an outage:
+**Response `200 OK`.** This notification failed 6 times and is in the dead-letter queue:
+
+```json
+{
+  "id": "1948de39-9858-4590-8610-9801d989dc59",
+  "idempotencyKey": "seed-dead-lettered",
+  "recipient": "katherine@example.com",
+  "channel": "SMS",
+  "priority": "NORMAL",
+  "status": "DEAD_LETTERED",
+  "scheduledAt": "2026-09-25T07:52:56.690Z",
+  "nextAttemptAt": "2026-09-25T07:52:56.690Z",
+  "attemptCount": 6,
+  "maxAttempts": 6,
+  "lastError": "Simulated provider outage",
+  "sentAt": null,
+  "failedAt": null,
+  "deadLetteredAt": "2026-09-25T07:52:56.690Z",
+  "cancelledAt": null,
+  "redriveCount": 0,
+  "lastRedrivenAt": null,
+  "createdAt": "2026-09-25T05:52:56.690Z",
+  "updatedAt": "2026-09-25T07:52:56.690Z"
+}
+```
+
+**Errors:** `404` if no notification has that ID, for example
+`"message": "Notification 3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c not found"`. `400` if the
+ID is not a valid UUID: `"message": "Validation failed (uuid is expected)"`.
+
+### List notifications
+
+`GET /notifications`
+
+```bash
+curl 'http://localhost:3000/notifications?status=DEAD_LETTERED&limit=20'
+```
+
+| Query parameter | Required | Rules |
+| --- | --- | --- |
+| `status` | No | Only notifications in this status. `DEAD_LETTERED` lists the dead-letter queue |
+| `recipient` | No | Only this recipient's notifications (exact match) |
+| `limit` | No | Page size, from 1 to 100. The default is 20 |
+| `cursor` | No | The `nextCursor` from the previous page |
+
+**Response `200 OK`.** Notifications are listed newest first:
+
+```json
+{
+  "items": [
+    { "id": "1948de39-9858-4590-8610-9801d989dc59", "status": "DEAD_LETTERED", "...": "..." }
+  ],
+  "nextCursor": null
+}
+```
+
+Each item in `items` is a full [notification object](#the-notification-object).
+`nextCursor` is `null` on the last page. Otherwise, pass it as `&cursor=...` to get the
+next page.
+
+### Cancel a notification
+
+`DELETE /notifications/{id}`
+
+```bash
+curl -X DELETE http://localhost:3000/notifications/dd0763d1-762f-4ce6-aac0-74d5b7eda399
+```
+
+**Response `200 OK`:** the notification, now cancelled. It will never be sent:
+
+```json
+{
+  "id": "dd0763d1-762f-4ce6-aac0-74d5b7eda399",
+  "status": "CANCELLED",
+  "cancelledAt": "2026-09-25T08:53:41.065Z",
+  "...": "the other fields, as in the notification object"
+}
+```
+
+Only a `PENDING` notification can be cancelled. Cancelling one that is already cancelled
+returns it unchanged, so the call is safe to repeat. Once a worker has started sending it,
+or it has finished, the answer is **`409 Conflict`**:
+
+```json
+{
+  "statusCode": 409,
+  "error": "Conflict",
+  "message": "Notification 02022eeb-f68e-4ee8-aaca-0ac03b74cfe5 is SENT; only PENDING jobs can be cancelled",
+  "path": "/notifications/02022eeb-f68e-4ee8-aaca-0ac03b74cfe5",
+  "requestId": "546cb543-ff00-49ed-86ee-f2ec86b648b8"
+}
+```
+
+### Retry one notification
+
+`POST /notifications/{id}/retry`
+
+```bash
+curl -X POST http://localhost:3000/notifications/1948de39-9858-4590-8610-9801d989dc59/retry
+```
+
+**Response `200 OK`:** the notification is back in the queue, due now, with a fresh set of
+6 attempts. `redriveCount` records the retry, and `lastError` is kept until the next
+attempt:
+
+```json
+{
+  "id": "1948de39-9858-4590-8610-9801d989dc59",
+  "status": "PENDING",
+  "nextAttemptAt": "2026-09-25T08:53:41.125Z",
+  "attemptCount": 0,
+  "maxAttempts": 6,
+  "lastError": "Simulated provider outage",
+  "deadLetteredAt": null,
+  "redriveCount": 1,
+  "lastRedrivenAt": "2026-09-25T08:53:41.125Z",
+  "...": "the other fields, as in the notification object"
+}
+```
+
+Only a `DEAD_LETTERED` or `FAILED` notification can be retried. Anything else returns
+**`409 Conflict`**, for example
+`"message": "Notification aab94e73-2114-4cfa-bf41-dc1132fc0a73 is PENDING; only DEAD_LETTERED or FAILED jobs can be retried"`.
+
+A retried notification goes through the normal process again. If it keeps failing, it
+returns to the dead-letter queue after 6 attempts.
+
+### Retry many notifications
+
+`POST /notifications/retry`
+
+Retry the oldest 100 notifications in the dead-letter queue (the body is optional):
 
 ```bash
 curl -X POST http://localhost:3000/notifications/retry
 ```
 
-The response says how many were retried and how many remain, for example
-`{ "retried": 100, "remaining": 250 }`. Each call retries up to 100 notifications, oldest
-first; repeat it until `remaining` is 0. You can send a body to change this:
+Or choose what to retry:
 
-- `status`: `DEAD_LETTERED` (the default) or `FAILED`.
-- `recipient`: only this recipient's notifications.
-- `limit`: how many to retry in one call, from 1 to 1,000.
+```bash
+curl -X POST http://localhost:3000/notifications/retry \
+  -H 'Content-Type: application/json' \
+  -d '{ "status": "FAILED", "recipient": "user@example.com", "limit": 500 }'
+```
 
-A retried notification starts again with 6 attempts. If it keeps failing, it goes back to
-the dead-letter queue.
+| Field | Required | Rules |
+| --- | --- | --- |
+| `status` | No | `DEAD_LETTERED` (the default) or `FAILED` |
+| `recipient` | No | Only this recipient's notifications |
+| `limit` | No | How many to retry in this call, oldest first, from 1 to 1,000. The default is 100 |
 
-**See the queue metrics** and **check the service health:**
+**Response `200 OK`:**
+
+```json
+{
+  "retried": 100,
+  "remaining": 250
+}
+```
+
+`retried` is how many notifications this call sent back to the queue. `remaining` is how
+many still match. Repeat the call until `remaining` is `0`. Each notification is reset in
+the same way as a single retry.
+
+An invalid `status` or `limit` returns **`400 Bad Request`**, for example
+`"status must be one of the following values: DEAD_LETTERED, FAILED"`.
+
+### Metrics
+
+`GET /metrics`
 
 ```bash
 curl http://localhost:3000/metrics
 ```
 
+**Response `200 OK`:**
+
+```json
+{
+  "pending": 23,
+  "processing": 0,
+  "sent": 1,
+  "failed": 0,
+  "deadLettered": 0,
+  "cancelled": 2,
+  "queueLagSeconds": 44.548,
+  "webhooks": {
+    "pending": 0,
+    "delivered": 4,
+    "givenUp": 0
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `pending` … `cancelled` | How many notifications are in each status |
+| `queueLagSeconds` | How long the oldest due notification has waited to be picked up. If this keeps rising, the workers are not keeping up |
+| `webhooks` | Webhook calls waiting to be sent, delivered, and given up after 10 failed attempts |
+
+### Health
+
+`GET /health`
+
 ```bash
 curl http://localhost:3000/health
 ```
 
-### All endpoints
+**Response `200 OK`** when the service and the database are working:
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/notifications` | Schedule a notification |
-| `GET` | `/notifications` | List notifications, filtered by `status` and/or `recipient` |
-| `GET` | `/notifications/{id}` | Get one notification's status and history |
-| `DELETE` | `/notifications/{id}` | Cancel a notification that has not been sent |
-| `POST` | `/notifications/{id}/retry` | Retry a dead-lettered or failed notification |
-| `POST` | `/notifications/retry` | Retry many dead-lettered or failed notifications at once |
-| `GET` | `/metrics` | Counts by status, and how long the oldest due notification has waited |
-| `GET` | `/health` | Whether the service and the database are working |
-| `POST` | `/webhooks/mock` | A demo receiver for webhook calls |
+```json
+{
+  "status": "ok",
+  "info": { "database": { "status": "up", "responseTime": 1 } },
+  "error": {},
+  "details": { "database": { "status": "up", "responseTime": 1 } }
+}
+```
 
-### Response codes
+If the database does not answer within 1.5 seconds, the response is
+**`503 Service Unavailable`**, with `"status": "error"`. Workers serve this endpoint too, on
+their own port.
 
-| Code | Meaning |
-| --- | --- |
-| `201` | A new notification was created |
-| `200` | Success. For a repeated request with the same idempotency key, this returns the original notification |
-| `400` | The request is invalid; the response explains why |
-| `404` | No notification has that `id` |
-| `409` | The action is not allowed in the notification's current state, or the idempotency key was already used for a different request |
+### Webhooks
 
-Every response includes an `X-Request-ID` header. The same ID appears in the logs, which
-makes problems easy to trace.
+When a notification reaches `SENT`, `FAILED` or `DEAD_LETTERED`, the service sends a
+`POST` request to `WEBHOOK_URL` with this body:
+
+```json
+{
+  "eventId": "7d9e2c41-5b3a-4f1e-9c8d-2a6b4e0f1c3d",
+  "jobId": "02022eeb-f68e-4ee8-aaca-0ac03b74cfe5",
+  "status": "SENT",
+  "attemptCount": 1,
+  "timestamp": "2026-09-25T09:00:01.000Z"
+}
+```
+
+The same `eventId` is also sent in the `X-Webhook-Event-Id` header. If your server does not
+answer with a `2xx` status, the call is retried with backoff, up to 10 attempts in total.
+A webhook can occasionally arrive twice, so use `eventId` to ignore repeats.
+
+#### Mock webhook receiver
+
+`POST /webhooks/mock`
+
+A demo receiver, so you can watch webhooks arrive without your own server. It is the
+default `WEBHOOK_URL`. It accepts the body above.
+
+**Response `200 OK`:**
+
+```json
+{
+  "eventId": "7d9e2c41-5b3a-4f1e-9c8d-2a6b4e0f1c3d",
+  "duplicate": false,
+  "receivedCount": 1
+}
+```
+
+If the same event arrives again, `duplicate` is `true` and `receivedCount` goes up.
 
 ## Tests
 
