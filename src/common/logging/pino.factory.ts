@@ -8,10 +8,15 @@ import { loggableError } from '../utils/error.util.js';
 export type LoggerSettings = Pick<AppConfig, 'nodeEnv' | 'role' | 'logLevel'>;
 
 /**
- * Paths that may hold notification content or credentials. Nothing in the
- * app logs them on purpose; this is the backstop if someone does.
+ * Paths that may hold personal data (recipients and notification content) or
+ * credentials. Nothing in the app logs them on purpose; this is the backstop
+ * if someone does. Logs identify a notification by its job ID only.
  */
 export const REDACTED_PATHS = [
+  'recipient',
+  '*.recipient',
+  'idempotencyKey',
+  '*.idempotencyKey',
   'payload',
   '*.payload',
   'body',

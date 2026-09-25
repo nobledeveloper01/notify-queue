@@ -67,6 +67,17 @@ export interface RecoveryOutcome {
   deadLettered: string[];
 }
 
+/** Gives back the attempt counted at claim time, for an attempt that never reached the provider. */
+const refundAttempt = (): string => 'attempt_count - 1';
+
+/**
+ * The outbox write: one webhook event per row of `source`, which must have
+ * the columns of `notification_jobs`.
+ */
+const insertWebhookEvents = (source: string): string =>
+  `INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at, redrive_count)
+   SELECT id, status, attempt_count, updated_at, redrive_count FROM ${source}`;
+
 /**
  * The only code that reads or writes `notification_jobs`.
  *
@@ -133,7 +144,8 @@ export class NotificationJobRepository {
 
     if (!job) {
       // Only reachable if the row was deleted between the two statements.
-      throw new Error(`Job for idempotency key "${input.idempotencyKey}" vanished after insert`);
+      // The key is client data, so it stays out of the message (which is logged).
+      throw new Error('Job vanished between insert and read-back');
     }
     return { job, created: inserted !== undefined };
   }
@@ -241,15 +253,9 @@ export class NotificationJobRepository {
    * and finds PROCESSING: the claim wins, the cancel reports false. So a job
    * is either cancelled and never sent, or sent and not cancelled.
    */
-  async cancelPending(id: string): Promise<boolean> {
-    const result = await this.jobs
-      .createQueryBuilder()
-      .update(NotificationJob)
-      .set({ status: OPERATOR_TRANSITIONS.cancel.to, cancelledAt: () => 'now()' })
-      .where('id = :id', { id })
-      .andWhere('status IN (:...from)', { from: OPERATOR_TRANSITIONS.cancel.from })
-      .execute();
-    return result.affected === 1;
+  cancelPending(id: string): Promise<boolean> {
+    const { from, to } = OPERATOR_TRANSITIONS.cancel;
+    return this.updateIf(id, from, { status: to, cancelledAt: () => 'now()' });
   }
 
   /**
@@ -259,25 +265,19 @@ export class NotificationJobRepository {
    * not collide with its previous one. `last_error` is kept as context until
    * the next attempt overwrites it.
    */
-  async redrive(id: string, maxAttempts: number): Promise<boolean> {
-    const result = await this.jobs
-      .createQueryBuilder()
-      .update(NotificationJob)
-      .set({
-        status: OPERATOR_TRANSITIONS.redrive.to,
-        attemptCount: 0,
-        maxAttempts,
-        reconciliationGranted: false,
-        nextAttemptAt: () => 'now()',
-        failedAt: null,
-        deadLetteredAt: null,
-        redriveCount: () => 'redrive_count + 1',
-        lastRedrivenAt: () => 'now()',
-      })
-      .where('id = :id', { id })
-      .andWhere('status IN (:...from)', { from: OPERATOR_TRANSITIONS.redrive.from })
-      .execute();
-    return result.affected === 1;
+  redrive(id: string, maxAttempts: number): Promise<boolean> {
+    const { from, to } = OPERATOR_TRANSITIONS.redrive;
+    return this.updateIf(id, from, {
+      status: to,
+      attemptCount: 0,
+      maxAttempts,
+      reconciliationGranted: false,
+      nextAttemptAt: () => 'now()',
+      failedAt: null,
+      deadLetteredAt: null,
+      redriveCount: () => 'redrive_count + 1',
+      lastRedrivenAt: () => 'now()',
+    });
   }
 
   /**
@@ -333,16 +333,8 @@ export class NotificationJobRepository {
    * waiting would still be sent by the original worker. False means the claim
    * is gone and the job must not be started.
    */
-  async startAttempt(id: string, claimToken: string): Promise<boolean> {
-    const result = await this.jobs
-      .createQueryBuilder()
-      .update(NotificationJob)
-      .set({ lockedAt: () => 'now()' })
-      .where('id = :id', { id })
-      .andWhere('claim_token = :claimToken', { claimToken })
-      .andWhere('status = :status', { status: JobStatus.Processing })
-      .execute();
-    return result.affected === 1;
+  startAttempt(id: string, claimToken: string): Promise<boolean> {
+    return this.updateIf(id, [JobStatus.Processing], { lockedAt: () => 'now()' }, claimToken);
   }
 
   /**
@@ -352,7 +344,7 @@ export class NotificationJobRepository {
    */
   releaseClaim(id: string, claimToken: string): Promise<boolean> {
     return this.completeClaim(id, claimToken, JobStatus.Pending, {
-      attemptCount: () => 'attempt_count - 1',
+      attemptCount: refundAttempt,
       nextAttemptAt: () => 'now()',
     });
   }
@@ -367,7 +359,7 @@ export class NotificationJobRepository {
       claimToken,
       JobStatus.Pending,
       {
-        attemptCount: () => 'attempt_count - 1',
+        attemptCount: refundAttempt,
         nextAttemptAt: () => ':until',
       },
       { until },
@@ -427,9 +419,7 @@ export class NotificationJobRepository {
         )
         RETURNING id, status, attempt_count, updated_at, redrive_count
        ), events AS (
-         INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at, redrive_count)
-         SELECT id, status, attempt_count, updated_at, redrive_count
-           FROM recovered WHERE status = $2
+         ${insertWebhookEvents('recovered WHERE status = $2')}
        )
        SELECT id, status FROM recovered`,
       [
@@ -483,16 +473,33 @@ export class NotificationJobRepository {
         return false;
       }
       if (isTerminal(to)) {
-        await this.run(
-          `INSERT INTO webhook_events (job_id, status, attempt_count, occurred_at, redrive_count)
-           SELECT id, status, attempt_count, updated_at, redrive_count
-             FROM notification_jobs WHERE id = $1`,
-          [id],
-          manager,
-        );
+        await this.run(insertWebhookEvents('notification_jobs WHERE id = $1'), [id], manager);
       }
       return true;
     });
+  }
+
+  /**
+   * One UPDATE of one job, applied only if the job is in one of `from` (and,
+   * when given, still carries `claimToken`). True if the job was changed.
+   */
+  private async updateIf(
+    id: string,
+    from: readonly JobStatus[],
+    changes: QueryDeepPartialEntity<NotificationJob>,
+    claimToken?: string,
+  ): Promise<boolean> {
+    const query = this.jobs
+      .createQueryBuilder()
+      .update(NotificationJob)
+      .set(changes)
+      .where('id = :id', { id })
+      .andWhere('status IN (:...from)', { from });
+    if (claimToken !== undefined) {
+      query.andWhere('claim_token = :claimToken', { claimToken });
+    }
+    const result = await query.execute();
+    return result.affected === 1;
   }
 
   private run<T = unknown>(

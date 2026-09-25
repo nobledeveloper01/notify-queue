@@ -1,10 +1,4 @@
-import {
-  BadRequestException,
-  ConflictException,
-  Injectable,
-  Logger,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { AppConfig } from '../../config/configuration.js';
 import {
@@ -12,6 +6,7 @@ import {
   SCHEDULE_EXACTLY_ONE_MESSAGE,
 } from '../../common/constants/job.constants.js';
 import { IdempotencyKeyReuseException } from '../../common/exceptions/idempotency.exception.js';
+import { JobStateConflictException } from '../../common/exceptions/job-state.exception.js';
 import { decodeCursor, encodeCursor } from '../../common/utils/cursor.util.js';
 import { fingerprintRequest } from '../../common/utils/idempotency.util.js';
 import { JobStatus } from '../../common/enums/job-status.enum.js';
@@ -115,8 +110,11 @@ export class NotificationsService {
     if (job.status === JobStatus.Cancelled) {
       return NotificationResponseDto.fromEntity(job);
     }
-    throw new ConflictException(
-      `Notification ${id} is ${job.status}; only ${OPERATOR_TRANSITIONS.cancel.from.join(', ')} jobs can be cancelled`,
+    throw new JobStateConflictException(
+      id,
+      job.status,
+      'cancelled',
+      OPERATOR_TRANSITIONS.cancel.from,
     );
   }
 
@@ -128,8 +126,11 @@ export class NotificationsService {
   async redrive(id: string): Promise<NotificationResponseDto> {
     if (!(await this.jobs.redrive(id, this.maxAttempts))) {
       const job = await this.getJob(id);
-      throw new ConflictException(
-        `Notification ${id} is ${job.status}; only ${OPERATOR_TRANSITIONS.redrive.from.join(' or ')} jobs can be retried`,
+      throw new JobStateConflictException(
+        id,
+        job.status,
+        'retried',
+        OPERATOR_TRANSITIONS.redrive.from,
       );
     }
     const job = await this.getJob(id);
@@ -165,7 +166,9 @@ export class NotificationsService {
 
     const at = new Date(sendAt as string);
     if (at.getTime() - Date.now() > MAX_SCHEDULE_AHEAD_SECONDS * 1000) {
-      throw new BadRequestException('sendAt must be within 365 days from now');
+      throw new BadRequestException(
+        `sendAt must be within ${MAX_SCHEDULE_AHEAD_SECONDS / 86_400} days from now`,
+      );
     }
     return { sendAt: at };
   }

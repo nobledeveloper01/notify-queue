@@ -26,6 +26,9 @@ x-app: &app
 services:
   postgres:
     image: postgres:17-alpine
+    # Terse error logs leave out DETAIL lines such as "Failing row contains
+    # (...)", which would copy recipients and payloads into the server log.
+    command: ['postgres', '-c', 'log_error_verbosity=terse']
     environment:
       POSTGRES_DB: notify_queue
       POSTGRES_USER: postgres

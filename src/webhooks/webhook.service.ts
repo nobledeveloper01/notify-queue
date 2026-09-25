@@ -8,7 +8,7 @@ import {
   WEBHOOK_EVENT_ID_HEADER,
 } from '../common/constants/webhook.constants.js';
 import type { AppConfig, WebhookConfig } from '../config/configuration.js';
-import { errorMessage } from '../common/utils/error.util.js';
+import { errorMessage, loggableError } from '../common/utils/error.util.js';
 import { RetryPolicyService } from '../retry/retry-policy.service.js';
 import type { WebhookEventDto } from './dto/webhook-event.dto.js';
 import { WebhookEventRepository } from './repositories/webhook-event.repository.js';
@@ -115,12 +115,11 @@ export class WebhookService {
     } catch (error: unknown) {
       // The outcome could not be recorded; the lease expires and the event is
       // dispatched again.
-      this.logger.error({
-        ...context,
-        event: 'webhook.record_failed',
-        delivered: failure === null,
-        error: errorMessage(error),
-      });
+      const { stack, ...details } = loggableError(error);
+      this.logger.error(
+        { ...context, event: 'webhook.record_failed', delivered: failure === null, error: details },
+        stack,
+      );
       return failure === null ? 'delivered' : 'retrying';
     }
   }

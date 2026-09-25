@@ -4,7 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import type { AppConfig, WorkerConfig } from '../config/configuration.js';
 import { AppRole } from '../config/env.validation.js';
-import { errorMessage } from '../common/utils/error.util.js';
+import { loggableError } from '../common/utils/error.util.js';
 import { WebhookService } from '../webhooks/webhook.service.js';
 import { WorkerRecoveryService } from './worker-recovery.service.js';
 import { WorkerService } from './worker.service.js';
@@ -116,36 +116,30 @@ export class WorkerScheduler implements OnApplicationBootstrap, BeforeApplicatio
       }
     } catch (error: unknown) {
       // Database unreachable, most likely. Keep the loop alive and try again.
-      this.logger.error({
-        event: 'worker.poll_failed',
-        workerId: this.config.id,
-        error: errorMessage(error),
-      });
+      this.logFailure('worker.poll_failed', error);
     }
     this.scheduleNextPoll(nextDelay);
   }
 
-  private async dispatchWebhooksSafely(): Promise<void> {
+  private dispatchWebhooksSafely(): Promise<void> {
+    return this.runSafely('webhook.dispatch_failed', () => this.webhooks.dispatchDue());
+  }
+
+  private recoverSafely(): Promise<void> {
+    return this.runSafely('worker.recovery_failed', () => this.recovery.recoverStale());
+  }
+
+  /** Runs background work that must never crash the worker: failures are logged, not thrown. */
+  private async runSafely(event: string, work: () => Promise<unknown>): Promise<void> {
     try {
-      await this.webhooks.dispatchDue();
+      await work();
     } catch (error: unknown) {
-      this.logger.error({
-        event: 'webhook.dispatch_failed',
-        workerId: this.config.id,
-        error: errorMessage(error),
-      });
+      this.logFailure(event, error);
     }
   }
 
-  private async recoverSafely(): Promise<void> {
-    try {
-      await this.recovery.recoverStale();
-    } catch (error: unknown) {
-      this.logger.error({
-        event: 'worker.recovery_failed',
-        workerId: this.config.id,
-        error: errorMessage(error),
-      });
-    }
+  private logFailure(event: string, error: unknown): void {
+    const { stack, ...details } = loggableError(error);
+    this.logger.error({ event, workerId: this.config.id, error: details }, stack);
   }
 }

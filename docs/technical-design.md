@@ -723,9 +723,12 @@ responds to a ping within 1.5 s. The container health checks use it.
 - **Safe errors.** One error shape. Stack traces, SQL and internal messages are logged
   server-side and never returned; unexpected errors become a generic 500.
 - **Safe logging.** Log serializers whitelist fields, so request bodies, headers and query
-  strings are never written. A redaction list backs this up for anything logged by hand.
-  Notification payloads are never logged and never returned by the API. A test asserts a
-  payload marker appears in no log line.
+  strings are never written. Logs identify a notification by its job ID only. A redaction
+  list (payloads, recipients, idempotency keys, bodies, headers) backs this up for anything
+  logged by hand. Notification payloads are never logged and never returned by the API.
+  Tests assert that a payload marker, a recipient and an idempotency key appear in no log
+  line. PostgreSQL runs with `log_error_verbosity=terse`, so its own server log leaves out
+  the "Failing row contains (...)" detail that would copy a row's personal data.
 - **Database errors are logged by code, not content.** A TypeORM query error carries its
   SQL and bound parameters (recipients, payloads), and PostgreSQL's messages can quote
   input values. Every such error is logged as its class, SQLSTATE and constraint name

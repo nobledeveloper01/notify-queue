@@ -57,4 +57,16 @@ describe('AppLogger', () => {
 
     expect(capture.text).not.toContain('SECRET');
   });
+
+  it('redacts recipients and idempotency keys even if someone logs one', () => {
+    logger.log({
+      event: 'oops',
+      recipient: 'ada@example.com',
+      job: { recipient: '+2348012345678', idempotencyKey: 'order-ada-42' },
+    });
+
+    expect(capture.text).not.toContain('ada@example.com');
+    expect(capture.text).not.toContain('+2348012345678');
+    expect(capture.text).not.toContain('order-ada-42');
+  });
 });
