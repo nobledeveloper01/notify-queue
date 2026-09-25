@@ -106,7 +106,7 @@ Controller → DTO → Service → Repository → PostgreSQL
 
 | Component | Responsibility |
 | --- | --- |
-| `NotificationsController` | Schedule, get, list, cancel and redrive; 201 vs 200 on replay |
+| `NotificationsController` | Schedule, get, list, cancel, redrive one job and redrive in bulk; 201 vs 200 on replay |
 | `NotificationsService` | Resolve the schedule, fingerprint the request, detect key reuse (409); cancel and redrive rules (404, 409, idempotent cancel, audited redrive); cursor decoding |
 | `NotificationJobRepository` | Every read and write of `notification_jobs`, including claiming, fenced completion, recovery and the outbox insert |
 | `job-state-machine.ts` | The legal status transitions; repositories derive their `WHERE status IN (…)` guards from it |
@@ -227,6 +227,7 @@ Two implementation notes:
    PENDING ──────── DELETE /notifications/:id ─────────▶ CANCELLED
    DEAD_LETTERED ┐
    FAILED ───────┴─ POST /notifications/:id/retry ─────▶ PENDING  (fresh attempt budget)
+                    POST /notifications/retry (bulk)
 ```
 
 - Terminal states (SENT, FAILED, DEAD_LETTERED, CANCELLED) have no *automatic* outgoing
@@ -506,6 +507,16 @@ counted in `/metrics` (`deadLettered`), and is **never retried automatically**. 
   with a fresh attempt budget. It is one conditional update
   (`WHERE status IN ('DEAD_LETTERED', 'FAILED')`), so it cannot touch a job in any other
   state.
+- **Bulk redrive:** `POST /notifications/retry` redrives up to `limit` jobs (default 100,
+  maximum 1,000) of one status (`DEAD_LETTERED` by default, or `FAILED`), optionally for
+  one recipient, oldest first. It is one `UPDATE … WHERE id IN (SELECT … ORDER BY
+  created_at LIMIT n FOR UPDATE SKIP LOCKED)` with the same changes as a single redrive,
+  and it returns `{ retried, remaining }` so an operator repeats it until `remaining` is 0.
+  SKIP LOCKED plus the re-checked status mean concurrent bulk calls never redrive a job
+  twice (a test runs five at once over 50 jobs). The batch limit keeps each statement
+  short and meters the burst sent to the provider; the per-recipient rate limit still
+  applies to every redriven job. The log line records the status, the counts and whether
+  a recipient filter was used, never the recipient itself.
 - **Audit:** each redrive increments `redrive_count`, stamps `last_redriven_at`, and logs
   `job.redriven` with the previous error. `last_error` is kept as context until the next
   attempt overwrites it.
@@ -698,7 +709,7 @@ them on exit; re-raising SIGTERM skips that flush and loses the last log lines.
 - **Every worker event:** `workerId`, `jobId`, `attempt`, `event` and `durationMs`. Events
   include `job.sent`, `job.retry`, `job.dead_letter`, `job.fail`, `job.rate_limited`,
   `job.released`, `job.claim_lost`, `jobs.recovered`, `worker.drained` and
-  `webhook.failed`. Operator actions log `job.cancelled` and `job.redriven`.
+  `webhook.failed`. Operator actions log `job.cancelled`, `job.redriven` and `jobs.redriven` (bulk).
 
 **Request IDs.** A caller's `X-Request-ID` is accepted if it is short and log-safe;
 otherwise one is generated. It is echoed on every response, included in every error body,
@@ -847,8 +858,9 @@ In the order they would bite:
 
 - **Authorisation for operator actions**: cancel and redrive should require an operator
   role, and redrive a reason, stored alongside the audit fields.
-- **Bulk redrive** (`POST /notifications/retry?status=DEAD_LETTERED&since=…`) after an
-  outage, rate-limited so it does not stampede the provider.
+- **Paced bulk redrive:** a `since` filter (only jobs dead-lettered after the outage
+  began), and a server-side job that works through a large dead-letter queue at a set
+  rate, instead of an operator repeating the call.
 - **Rate-limit-aware claiming** to remove hot-recipient churn (section 20).
 - **Signed webhooks** (HMAC-SHA256 of the body with a shared secret, plus a timestamp to
   stop replays).

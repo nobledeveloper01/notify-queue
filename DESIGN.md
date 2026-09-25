@@ -124,7 +124,8 @@ Other possible outcomes:
 
 SENT, FAILED, DEAD_LETTERED and CANCELLED are final. The system never moves a notification
 out of these states on its own. Only an operator can send a FAILED or DEAD_LETTERED
-notification back to PENDING, using the retry endpoint.
+notification back to PENDING, using a retry endpoint (for one notification, or for many
+at once).
 
 ## 5. Exactly-once delivery
 
@@ -270,6 +271,15 @@ retried forever, and it is not deleted.
 - An operator can send it back with a fresh set of attempts, for example after an outage:
   `POST /notifications/{id}/retry`. Each retry by an operator is recorded on the
   notification.
+- After a long outage, an operator can retry many at once: `POST /notifications/retry`.
+  Each call retries up to 1,000 notifications, oldest first, and returns how many remain,
+  so the operator repeats the call until none remain. Working in batches keeps each
+  database update short, and avoids sending a huge burst to the provider at once.
+
+A retried notification goes through the normal process again. Its attempts start again at
+0 of 6. If it succeeds, it becomes SENT. If it keeps failing, it is retried with backoff
+and, after 6 attempts, returns to the dead-letter queue, with a second webhook. It never
+loops forever, because only an operator can retry it again.
 
 FAILED and DEAD_LETTERED are kept separate on purpose. FAILED means the provider rejected
 the notification, so something must be fixed first. DEAD_LETTERED means the provider kept

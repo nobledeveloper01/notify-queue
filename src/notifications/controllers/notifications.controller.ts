@@ -32,6 +32,7 @@ import { ErrorResponseDto } from '../../common/dto/error-response.dto.js';
 import { ListNotificationsQueryDto } from '../dto/list-notifications-query.dto.js';
 import { NotificationPageDto } from '../dto/notification-page.dto.js';
 import { NotificationResponseDto } from '../dto/notification-response.dto.js';
+import { RetryBatchResultDto, RetryNotificationsDto } from '../dto/retry-notifications.dto.js';
 import { ScheduleNotificationDto } from '../dto/schedule-notification.dto.js';
 import { NotificationsService } from '../services/notifications.service.js';
 
@@ -110,6 +111,20 @@ export class NotificationsController {
   @ApiBadRequestResponse({ type: ErrorResponseDto, description: 'Invalid filter or cursor.' })
   list(@Query() query: ListNotificationsQueryDto): Promise<NotificationPageDto> {
     return this.notificationsService.list(query);
+  }
+
+  @Post('retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Redrive many dead-lettered or failed notifications at once',
+    description:
+      'Sends up to `limit` DEAD_LETTERED (default) or FAILED jobs back to the queue, oldest first, each with a fresh attempt budget, exactly as the single-job retry does. `remaining` says how many still match: repeat the call until it is 0. An empty body retries the first 100 dead-lettered jobs.',
+  })
+  @ApiBody({ type: RetryNotificationsDto, required: false })
+  @ApiOkResponse({ type: RetryBatchResultDto })
+  @ApiBadRequestResponse({ type: ErrorResponseDto, description: 'Invalid status or limit.' })
+  redriveMany(@Body() dto: RetryNotificationsDto): Promise<RetryBatchResultDto> {
+    return this.notificationsService.redriveMany(dto);
   }
 
   @Delete(':id')

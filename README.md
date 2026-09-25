@@ -35,14 +35,14 @@ a dead-letter queue instead of retrying forever.
 - **Duplicate protection:** every request has an idempotency key. Sending the same request
   twice creates only one notification.
 - **Retries with exponential backoff:** each retry waits about twice as long as the last.
-- **Dead-letter queue:** after 6 failed attempts, a notification is set aside, and it can be
-  retried by hand later.
+- **Dead-letter queue:** after 6 failed attempts, a notification is set aside. An operator
+  can retry it later, one at a time or many at once.
 - **Rate limiting:** at most 10 notifications per recipient per rolling hour. Extra
   notifications wait; they are not failed.
 - **Webhooks:** your system is told when a notification is sent, fails or is dead-lettered.
 - **Status and metrics:** look up any notification, and see live counts for the whole queue.
-- **Operator actions:** list notifications, cancel one that has not been sent, and retry one
-  from the dead-letter queue.
+- **Operator actions:** list notifications, cancel one that has not been sent, and retry
+  notifications from the dead-letter queue, one at a time or in batches.
 
 ## How it works
 
@@ -213,6 +213,23 @@ curl -X DELETE http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6
 curl -X POST http://localhost:3000/notifications/3f6c2b0e-8a5d-4c1e-9b7a-2d4e6f8a0b1c/retry
 ```
 
+**Retry many at once**, for example the whole dead-letter queue after an outage:
+
+```bash
+curl -X POST http://localhost:3000/notifications/retry
+```
+
+The response says how many were retried and how many remain, for example
+`{ "retried": 100, "remaining": 250 }`. Each call retries up to 100 notifications, oldest
+first; repeat it until `remaining` is 0. You can send a body to change this:
+
+- `status`: `DEAD_LETTERED` (the default) or `FAILED`.
+- `recipient`: only this recipient's notifications.
+- `limit`: how many to retry in one call, from 1 to 1,000.
+
+A retried notification starts again with 6 attempts. If it keeps failing, it goes back to
+the dead-letter queue.
+
 **See the queue metrics** and **check the service health:**
 
 ```bash
@@ -232,6 +249,7 @@ curl http://localhost:3000/health
 | `GET` | `/notifications/{id}` | Get one notification's status and history |
 | `DELETE` | `/notifications/{id}` | Cancel a notification that has not been sent |
 | `POST` | `/notifications/{id}/retry` | Retry a dead-lettered or failed notification |
+| `POST` | `/notifications/retry` | Retry many dead-lettered or failed notifications at once |
 | `GET` | `/metrics` | Counts by status, and how long the oldest due notification has waited |
 | `GET` | `/health` | Whether the service and the database are working |
 | `POST` | `/webhooks/mock` | A demo receiver for webhook calls |

@@ -62,6 +62,13 @@ export interface JobPage {
   next: JobListPosition | null;
 }
 
+/** Which dead-lettered or failed jobs a bulk redrive takes, oldest first. */
+export interface RedriveFilter {
+  status: JobStatus;
+  recipient?: string;
+  limit: number;
+}
+
 export interface RecoveryOutcome {
   requeued: string[];
   deadLettered: string[];
@@ -69,6 +76,25 @@ export interface RecoveryOutcome {
 
 /** Gives back the attempt counted at claim time, for an attempt that never reached the provider. */
 const refundAttempt = (): string => 'attempt_count - 1';
+
+/**
+ * What a redrive changes: back to PENDING, due now, with a fresh attempt
+ * budget. The redrive is counted and timestamped for audit, and the redrive
+ * count is also the webhook generation, so the job's next terminal event does
+ * not collide with its previous one. `last_error` is kept as context until
+ * the next attempt overwrites it.
+ */
+const redriveChanges = (maxAttempts: number): QueryDeepPartialEntity<NotificationJob> => ({
+  status: OPERATOR_TRANSITIONS.redrive.to,
+  attemptCount: 0,
+  maxAttempts,
+  reconciliationGranted: false,
+  nextAttemptAt: () => 'now()',
+  failedAt: null,
+  deadLetteredAt: null,
+  redriveCount: () => 'redrive_count + 1',
+  lastRedrivenAt: () => 'now()',
+});
 
 /**
  * The outbox write: one webhook event per row of `source`, which must have
@@ -258,26 +284,44 @@ export class NotificationJobRepository {
     return this.updateIf(id, from, { status: to, cancelledAt: () => 'now()' });
   }
 
-  /**
-   * DEAD_LETTERED or FAILED → PENDING with a fresh attempt budget, due now.
-   * The redrive is counted and timestamped for audit, and the redrive count
-   * is also the webhook generation, so this job's next terminal event does
-   * not collide with its previous one. `last_error` is kept as context until
-   * the next attempt overwrites it.
-   */
+  /** DEAD_LETTERED or FAILED → PENDING with a fresh attempt budget (see `redriveChanges`). */
   redrive(id: string, maxAttempts: number): Promise<boolean> {
-    const { from, to } = OPERATOR_TRANSITIONS.redrive;
-    return this.updateIf(id, from, {
-      status: to,
-      attemptCount: 0,
-      maxAttempts,
-      reconciliationGranted: false,
-      nextAttemptAt: () => 'now()',
-      failedAt: null,
-      deadLetteredAt: null,
-      redriveCount: () => 'redrive_count + 1',
-      lastRedrivenAt: () => 'now()',
-    });
+    return this.updateIf(id, OPERATOR_TRANSITIONS.redrive.from, redriveChanges(maxAttempts));
+  }
+
+  /**
+   * Redrives up to `filter.limit` jobs in one statement, oldest first, and
+   * returns how many. SKIP LOCKED passes over rows another redrive (or a
+   * single-job redrive) is changing at that moment, and the outer status
+   * check re-tests each row, so concurrent calls never redrive a job twice.
+   * The limit keeps each statement short: a huge dead-letter queue is
+   * drained over several calls instead of locking every row at once.
+   */
+  async redriveMany(filter: RedriveFilter, maxAttempts: number): Promise<number> {
+    const { recipient } = filter;
+    const result = await this.jobs
+      .createQueryBuilder()
+      .update(NotificationJob)
+      .set(redriveChanges(maxAttempts))
+      .where(
+        `id IN (
+          SELECT id FROM notification_jobs
+           WHERE status = :status ${recipient === undefined ? '' : 'AND recipient = :recipient'}
+           ORDER BY created_at, id
+           LIMIT :limit
+           FOR UPDATE SKIP LOCKED)`,
+        { status: filter.status, recipient, limit: filter.limit },
+      )
+      // Re-checked after any wait, and only ever a status redrive may start from.
+      .andWhere('status = :status')
+      .andWhere('status IN (:...from)', { from: OPERATOR_TRANSITIONS.redrive.from })
+      .execute();
+    return result.affected ?? 0;
+  }
+
+  /** How many jobs match a redrive filter, ignoring its limit. */
+  countRedrivable({ status, recipient }: RedriveFilter): Promise<number> {
+    return this.jobs.countBy({ status, ...(recipient === undefined ? {} : { recipient }) });
   }
 
   /**

@@ -13,11 +13,13 @@ import { JobStatus } from '../../common/enums/job-status.enum.js';
 import { OPERATOR_TRANSITIONS } from '../domain/job-state-machine.js';
 import { DEFAULT_PAGE_SIZE } from '../dto/list-notifications-query.dto.js';
 import type { ListNotificationsQueryDto } from '../dto/list-notifications-query.dto.js';
+import { DEFAULT_RETRY_BATCH_SIZE } from '../dto/retry-notifications.dto.js';
+import type { RetryBatchResultDto, RetryNotificationsDto } from '../dto/retry-notifications.dto.js';
 import type { NotificationPageDto } from '../dto/notification-page.dto.js';
 import { NotificationResponseDto } from '../dto/notification-response.dto.js';
 import type { ScheduleNotificationDto } from '../dto/schedule-notification.dto.js';
 import { NotificationJobRepository } from '../repositories/notification-job.repository.js';
-import type { JobSchedule } from '../repositories/notification-job.repository.js';
+import type { JobSchedule, RedriveFilter } from '../repositories/notification-job.repository.js';
 import type { NotificationJob } from '../entities/notification-job.entity.js';
 
 export interface ScheduleResult {
@@ -141,6 +143,32 @@ export class NotificationsService {
       previousError: job.lastError,
     });
     return NotificationResponseDto.fromEntity(job);
+  }
+
+  /**
+   * Redrives a batch of the dead-letter queue (or of FAILED jobs) at once,
+   * oldest first, and says how many still match, so an operator can repeat
+   * the call until none remain. Each job is reset exactly as a single redrive
+   * resets it, so one that fails again goes back through its retries and,
+   * if they run out, back to the dead-letter queue.
+   */
+  async redriveMany(dto: RetryNotificationsDto): Promise<RetryBatchResultDto> {
+    const filter: RedriveFilter = {
+      status: dto.status ?? JobStatus.DeadLettered,
+      recipient: dto.recipient,
+      limit: dto.limit ?? DEFAULT_RETRY_BATCH_SIZE,
+    };
+    const retried = await this.jobs.redriveMany(filter, this.maxAttempts);
+    const remaining = await this.jobs.countRedrivable(filter);
+    // The recipient filter is personal data, so the log records only whether one was used.
+    this.logger.warn({
+      event: 'jobs.redriven',
+      status: filter.status,
+      byRecipient: filter.recipient !== undefined,
+      retried,
+      remaining,
+    });
+    return { retried, remaining };
   }
 
   private async getJob(id: string): Promise<NotificationJob> {

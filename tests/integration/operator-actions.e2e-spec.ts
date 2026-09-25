@@ -41,6 +41,32 @@ describe('Cancel, redrive and list (HTTP + PostgreSQL)', () => {
       [jobId],
     );
 
+  /** Inserts `count` jobs that have already finished in `status`, oldest first. */
+  const insertFinished = async (
+    count: number,
+    { status = 'DEAD_LETTERED', recipient = 'dead@example.com' } = {},
+  ): Promise<string[]> => {
+    const finishedAt = status === 'FAILED' ? 'failed_at' : 'dead_lettered_at';
+    const rows: { id: string }[] = await dataSource.query(
+      `INSERT INTO notification_jobs
+         (idempotency_key, recipient, channel, payload, priority, scheduled_at, next_attempt_at,
+          max_attempts, attempt_count, status, ${finishedAt}, last_error, created_at)
+       SELECT $1 || '-' || n, $2, 'EMAIL', '{}', 2, now(), now(), 6, 6, $3, now(),
+              'Provider unavailable', now() - make_interval(secs => $4 - n)
+         FROM generate_series(1, $4) AS n
+       RETURNING id`,
+      [`${status}-${recipient}`, recipient, status, count],
+    );
+    return rows.map((row) => row.id);
+  };
+
+  const statusCounts = async (): Promise<Record<string, number>> => {
+    const rows: { status: string; count: string }[] = await dataSource.query(
+      'SELECT status, count(*) AS count FROM notification_jobs GROUP BY status',
+    );
+    return Object.fromEntries(rows.map((row) => [row.status, Number(row.count)]));
+  };
+
   beforeAll(async () => {
     dataSource = await createTestDataSource();
     jobs = new NotificationJobRepository(dataSource);
@@ -198,6 +224,135 @@ describe('Cancel, redrive and list (HTTP + PostgreSQL)', () => {
       const { http } = await start();
 
       await http.post(`/notifications/${UNKNOWN_ID}/retry`).expect(404);
+    });
+  });
+
+  describe('POST /notifications/retry (bulk)', () => {
+    it('retries the whole dead-letter queue and leaves every other job alone', async () => {
+      const { http } = await start();
+      const dead = await insertFinished(3);
+      await insertFinished(1, { status: 'FAILED' });
+      const { job: pending } = await jobs.insertIfAbsent(
+        newJob({ schedule: { delaySeconds: 3600 } }),
+      );
+
+      const res = await http.post('/notifications/retry').send({}).expect(200);
+
+      expect(res.body).toEqual({ retried: 3, remaining: 0 });
+      expect(await statusCounts()).toEqual({ PENDING: 4, FAILED: 1 });
+      for (const id of dead) {
+        const job = await jobs.findById(id);
+        expect([job?.status, job?.attemptCount, job?.maxAttempts, job?.redriveCount]).toEqual([
+          JobStatus.Pending,
+          0,
+          6,
+          1,
+        ]);
+      }
+      expect((await jobs.findById(pending.id))?.redriveCount).toBe(0);
+    });
+
+    it('works with no body at all', async () => {
+      const { http } = await start();
+      await insertFinished(2);
+
+      const res = await http.post('/notifications/retry').expect(200);
+
+      expect(res.body).toEqual({ retried: 2, remaining: 0 });
+    });
+
+    it('takes at most `limit` jobs, oldest first, and reports how many remain', async () => {
+      const { http } = await start();
+      const [oldest, middle, newest] = await insertFinished(3);
+
+      const first = await http.post('/notifications/retry').send({ limit: 2 }).expect(200);
+      expect(first.body).toEqual({ retried: 2, remaining: 1 });
+      expect((await jobs.findById(oldest))?.status).toBe(JobStatus.Pending);
+      expect((await jobs.findById(middle))?.status).toBe(JobStatus.Pending);
+      expect((await jobs.findById(newest))?.status).toBe(JobStatus.DeadLettered);
+
+      const second = await http.post('/notifications/retry').send({ limit: 2 }).expect(200);
+      expect(second.body).toEqual({ retried: 1, remaining: 0 });
+    });
+
+    it('retries FAILED jobs when asked, and only those', async () => {
+      const { http } = await start();
+      await insertFinished(2);
+      await insertFinished(2, { status: 'FAILED' });
+
+      const res = await http.post('/notifications/retry').send({ status: 'FAILED' }).expect(200);
+
+      expect(res.body).toEqual({ retried: 2, remaining: 0 });
+      expect(await statusCounts()).toEqual({ PENDING: 2, DEAD_LETTERED: 2 });
+    });
+
+    it('can be limited to one recipient', async () => {
+      const { http } = await start();
+      await insertFinished(2, { recipient: 'a@example.com' });
+      await insertFinished(3, { recipient: 'b@example.com' });
+
+      const res = await http
+        .post('/notifications/retry')
+        .send({ recipient: 'a@example.com' })
+        .expect(200);
+
+      expect(res.body).toEqual({ retried: 2, remaining: 0 });
+      expect(await statusCounts()).toEqual({ PENDING: 2, DEAD_LETTERED: 3 });
+    });
+
+    it('never retries a job twice when several bulk retries run at the same moment', async () => {
+      const { http } = await start();
+      const dead = await insertFinished(50);
+
+      const responses = await Promise.all(
+        Array.from({ length: 5 }, () => http.post('/notifications/retry').send({ limit: 20 })),
+      );
+
+      const retried = responses.map((res) => res.body.retried as number);
+      expect(retried.reduce((sum, n) => sum + n, 0)).toBe(50);
+      const [{ max }]: { max: number }[] = await dataSource.query(
+        'SELECT max(redrive_count) AS max FROM notification_jobs WHERE id = ANY($1::uuid[])',
+        [dead],
+      );
+      expect(max).toBe(1);
+      expect(await statusCounts()).toEqual({ PENDING: 50 });
+    });
+
+    it('sends failing jobs back through their retries and into the dead-letter queue again', async () => {
+      const { http, worker } = await start(new AlwaysFailProvider(true), { MAX_RETRIES: '1' });
+      const first = await deadLetter(worker);
+      const second = await deadLetter(worker);
+
+      const res = await http.post('/notifications/retry').send({}).expect(200);
+      await runUntilSettled(worker, dataSource);
+
+      expect(res.body).toEqual({ retried: 2, remaining: 0 });
+      for (const id of [first, second]) {
+        const job = await jobs.findById(id);
+        expect([job?.status, job?.attemptCount, job?.redriveCount]).toEqual([
+          JobStatus.DeadLettered,
+          2,
+          1,
+        ]);
+        expect(await eventsFor(id)).toEqual([
+          { status: 'DEAD_LETTERED', redrive_count: 0 },
+          { status: 'DEAD_LETTERED', redrive_count: 1 },
+        ]);
+      }
+    });
+
+    it.each([
+      ['a status that cannot be retried', { status: 'SENT' }],
+      ['an unknown status', { status: 'LOST' }],
+      ['a limit of 0', { limit: 0 }],
+      ['a limit over 1000', { limit: 1001 }],
+      ['an unknown field', { all: true }],
+    ])('rejects %s with 400', async (_, body) => {
+      const { http } = await start();
+      await insertFinished(1);
+
+      await http.post('/notifications/retry').send(body).expect(400);
+      expect(await statusCounts()).toEqual({ DEAD_LETTERED: 1 });
     });
   });
 
